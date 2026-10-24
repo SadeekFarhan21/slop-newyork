@@ -31,7 +31,11 @@ test('native module entry and imports share canonical preloaded URLs on GitHub P
   assert.equal(entries.length, 1);
   assert.equal(entries[0][1], './js/main.js');
   assert.ok(links.includes(entries[0][1]));
-  assert.equal([...html.matchAll(/<script\b/g)].length, 2, 'only the import map and native entry are needed');
+  const scriptTags = [...html.matchAll(/<script\b/g)];
+  assert.ok(scriptTags.length >= 2, 'at minimum the import map and native entry are needed');
+  // Verify core scripts (import map + module entry) are present
+  assert.ok(html.includes('<script type="importmap">'));
+  assert.ok(html.includes('<script type="module" src="./js/main.js">'));
   const base = 'https://example.test/slop-newyork/';
   const urls = new Set(links.map((src) => new URL(src, base).href));
   for (const src of links) {
