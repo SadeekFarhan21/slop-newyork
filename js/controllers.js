@@ -43,6 +43,10 @@ const BICYCLE_DRIVE = {
   speed: 12.8, boostSpeed: 19, reverseSpeed: 4.5, acceleration: 9, boostAcceleration: 13.5,
   rolling: 0.08, drag: 0.004, coast: 0.2, brake: 7.5 // Backward input is scaled to 0.6, giving 4.5 m/s² braking.
 };
+// The helicopter's body origin flies between 0.25 m above the ground under it (skids clear of the street or a park's
+// lawn) and a 380 m ceiling
+const HELI_FLOOR = 0.25;
+const HELI_CEILING = 380;
 
 function driveSpeed(speed, throttle, boost, dt, drive) {
   const braking = speed * throttle < 0;
@@ -61,6 +65,17 @@ function driveSpeed(speed, throttle, boost, dt, drive) {
 
 // Walking surface for the player's pedestrian (its rig samples it around its feet)
 const personGround = (controllers, x, z) => controllers.getGroundHeight(x, z, 'person');
+
+// A cyclist or helicopter pushed back by (dx, dz) out of a building or from the shore only moves along its heading, so
+// it keeps just the share of its speed that runs along the surface: a head-on hit stops it dead, a glancing scrape
+// barely slows it. The share is what remains per 60th of a second in contact, so that pressing on into a wall drags
+// alike at any frame rate
+function slideAlong(entity, dx, dz, dt) {
+  const push = Math.hypot(dx, dz);
+  if (!push) return;
+  const facing = (Math.sin(entity.heading) * dx + Math.cos(entity.heading) * dz) / push;
+  if (facing * entity.speed < 0) entity.speed *= Math.max(0, 1 - facing * facing) ** (dt * 60);
+}
 
 function collisionBody(mode, radius, heading, margin = 0) {
   const car = mode === 'car';
@@ -256,8 +271,14 @@ class ThirdPersonControllerManager {
     this._gamepadKeys = {};
 
     const onKey = (e, isDown) => {
+      // macOS sends no keyup for a key let go while Cmd is down, so no held key can be trusted once Cmd is released
+      if (!isDown && e.key === 'Meta') {
+        this.clearKeyboardInput();
+        return;
+      }
       const action = actionsByCode.get(e.code);
-      if (!action || (isDown && isTypingInField(e))) return;
+      // Presses don't count while typing in a field or as part of a Cmd / Ctrl shortcut; releases always do
+      if (!action || (isDown && (e.metaKey || e.ctrlKey || isTypingInField(e)))) return;
       if (isDown) this._pressedCodes.add(e.code);
       else this._pressedCodes.delete(e.code);
       // Releasing one binding must not cancel another key held for the same action.
@@ -307,6 +328,12 @@ class ThirdPersonControllerManager {
     for (const action of Object.keys(this.keys)) this._blendInput(action);
   }
 
+  clearKeyboardInput() {
+    this._pressedCodes.clear();
+    this._keyboardKeys = {};
+    for (const action of Object.keys(this.keys)) this._blendInput(action);
+  }
+
   resetInput() {
     this._pressedCodes.clear();
     this._keyboardKeys = {};
@@ -317,6 +344,8 @@ class ThirdPersonControllerManager {
 
   setMode(mode) {
     if (!this.entities[mode]) return;
+    // The one left behind parks where it is rather than freezing with its speed (to lurch off with it on return)
+    if (mode !== this.activeMode) this.stopEntity(this.getActiveEntity());
     this.activeMode = mode;
   }
 
@@ -324,27 +353,11 @@ class ThirdPersonControllerManager {
     return this.entities[this.activeMode];
   }
 
-  teleportActiveTo(x, z, heading = Math.PI, savedAltitude = null) {
-    const ent = this.getActiveEntity();
-    this.resetInput();
-    if (!Number.isFinite(heading)) heading = ent.heading;
-    const heli = this.activeMode === 'helicopter';
-    const altitude = heli ? Math.max(0.25, Math.min(380, savedAltitude ?? Math.max(92, ent.position.y))) : 0;
-    const destination = this.findTeleportPosition(x, z, heading, altitude);
-    if (destination) {
-      ent.position.x = destination.x;
-      ent.position.z = destination.z;
-      ent.heading = heading;
-      ent.position.y = heli ? altitude : this.getGroundHeight(destination.x, destination.z, this.activeMode);
-    }
+  // Brought to rest: no speed, slide, spin or climb carried on, wheels straight and the body level again (a pedestrian
+  // in mid-jump still comes down)
+  stopEntity(ent) {
     ent.speed = 0;
-    if (this.activeMode === 'person') {
-      ent.verticalVel = 0;
-      ent.rig.reset(ent.position.x, ent.position.z, ent.heading, personGround, this);
-      ent.crowd.begin();
-      ent.crowd.add(ent.rig, 0);
-      ent.crowd.end();
-    } else if (this.activeMode === 'car') {
+    if (ent.type === 'car') {
       ent.vx = ent.vz = ent.angularVel = ent.steerAngle = 0;
       ent.pitchVel = ent.rollVel = ent.heaveY = ent.heaveVel = 0;
       ent.chassisPivot.rotation.x = ent.chassisPivot.rotation.z = 0;
@@ -352,16 +365,46 @@ class ThirdPersonControllerManager {
       ent.lastCollisionSpark = null;
       for (const wheel of ent.wheels) if (wheel.isFront) wheel.steerPivot.rotation.y = 0;
       if (ent.carState) ent.carState.value.x = 1;
-    } else if (this.activeMode === 'cyclist') {
+    } else if (ent.type === 'cyclist') {
       ent.leanAngle = ent.leanPivot.rotation.z = 0;
-    } else if (heli) {
+    } else if (ent.type === 'helicopter') {
       ent.verticalSpeed = ent.pitchAngle = ent.rollAngle = 0;
       ent.tiltPivot.rotation.x = ent.tiltPivot.rotation.z = 0;
       ent.tiltPivot.position.y = 0;
     }
+  }
+
+  teleportActiveTo(x, z, heading = Math.PI, savedAltitude = null) {
+    const ent = this.getActiveEntity();
+    this.resetInput();
+    if (!Number.isFinite(heading)) heading = ent.heading;
+    const heli = this.activeMode === 'helicopter';
+    const altitude = heli ? Math.min(HELI_CEILING, savedAltitude ?? Math.max(92, ent.position.y)) : 0;
+    const destination = this.findTeleportPosition(x, z, heading, altitude);
+    if (destination) {
+      ent.position.x = destination.x;
+      ent.position.z = destination.z;
+      ent.heading = heading;
+      ent.position.y = this.arrivalHeight(destination.x, destination.z, altitude);
+    }
+    this.stopEntity(ent);
+    if (this.activeMode === 'person') {
+      ent.verticalVel = 0;
+      ent.rig.reset(ent.position.x, ent.position.z, ent.heading, personGround, this);
+      ent.crowd.begin();
+      ent.crowd.add(ent.rig, 0);
+      ent.crowd.end();
+    }
     ent.mesh.position.copy(ent.position);
     ent.mesh.rotation.y = ent.heading;
     return { x: ent.position.x, z: ent.position.z };
+  }
+
+  // Where the active entity arrives over (x, z): on the ground, or the helicopter at its altitude but never below its
+  // floor there
+  arrivalHeight(x, z, altitude) {
+    if (this.activeMode !== 'helicopter') return this.getGroundHeight(x, z, this.activeMode);
+    return Math.max(altitude, this.helicopterFloor(x, z));
   }
 
   // Find a fully clear arrival before moving the player. Sequential collision pushes can leave a player trapped
@@ -396,7 +439,7 @@ class ThirdPersonControllerManager {
     };
     const clear = (p) => {
       if (!p) return false;
-      const baseY = heli ? altitude : this.getGroundHeight(p.x, p.z, this.activeMode);
+      const baseY = this.arrivalHeight(p.x, p.z, altitude);
       // Keep other player models out of both the arrival and its default chase view. A corridor also prevents a
       // parked car between camera and character from hiding the character even when the camera itself is outside it.
       const viewTop = baseY + Math.max(body[entity.type][1], cameraUp);
@@ -848,6 +891,11 @@ class ThirdPersonControllerManager {
     return 0.0;
   }
 
+  // The lowest the helicopter can fly over (x, z), its skids just clear of the ground (raised in the parks)
+  helicopterFloor(x, z) {
+    return this.getGroundHeight(x, z, 'helicopter') + HELI_FLOOR;
+  }
+
   // The colliders whose bounds come within `r` of (x, z), in their original order. They never move, so they are
   // bucketed once into 48 m cells (tens of thousands of buildings: testing them all every frame cost ~0.5 ms)
   nearColliders(x, z, r) {
@@ -897,11 +945,19 @@ class ThirdPersonControllerManager {
       const shore = getIslandBoundsAtZ(pos.z);
       const minShoreX = shore.westX + 8.0;
       const maxShoreX = shore.eastX - 8.0;
-      if (pos.x < minShoreX) {
-        pos.x = minShoreX;
-        if (carEntity && carEntity.speed) carEntity.speed *= 0.4;
-      } else if (pos.x > maxShoreX) {
-        pos.x = maxShoreX;
+      const west = pos.x < minShoreX;
+      if (west || pos.x > maxShoreX) {
+        // The shore runs at a slant to the street grid: push straight out from it, not along x alone, so a cyclist
+        // feels how squarely it rode into it and anything pressed against a steep stretch (a pier's side) slides along
+        // it rather than being held in place
+        const along = getIslandBoundsAtZ(pos.z + 0.01);
+        const slope = (west ? along.westX - shore.westX : along.eastX - shore.eastX) / 0.01;
+        const share = ((west ? minShoreX : maxShoreX) - pos.x) / (1 + slope * slope);
+        pos.x += share;
+        pos.z -= slope * share;
+        // and kept on the land side where the shore bends
+        const bend = getIslandBoundsAtZ(pos.z);
+        pos.x = west ? Math.max(pos.x, bend.westX + 8.0) : Math.min(pos.x, bend.eastX - 8.0);
         if (carEntity && carEntity.speed) carEntity.speed *= 0.4;
       }
     }
@@ -1003,14 +1059,8 @@ class ThirdPersonControllerManager {
     if (this.activeMode === 'person') {
       this.updatePerson(dt, elapsed);
     } else {
-      // Keep the sidewalk pedestrian walking naturally when not actively controlled
-      const p = this.entities.person;
-      const walkSpeed = 1.48;
-      p.speed = walkSpeed;
-      p.position.x += Math.sin(p.heading) * walkSpeed * dt;
-      p.position.z += Math.cos(p.heading) * walkSpeed * dt;
-      if (p.position.z < -340) p.heading = 0;
-      else if (p.position.z > 340) p.heading = Math.PI;
+      // The pedestrian waits where the player left it, as the parked vehicles do; a jump in progress still comes down
+      this.updatePersonVertical(this.entities.person, dt, false);
     }
 
     if (this.activeMode === 'car') {
@@ -1063,9 +1113,13 @@ class ThirdPersonControllerManager {
     p.position.x += Math.sin(p.heading) * p.speed * dt;
     p.position.z += Math.cos(p.heading) * p.speed * dt;
     this.resolveHorizontalCollision(p.position, 0.48);
+    this.updatePersonVertical(p, dt, this.keys.up);
+  }
 
+  // Jump off the ground when asked, and fall back onto the walking surface under the pedestrian
+  updatePersonVertical(p, dt, jump) {
     const groundY = this.getGroundHeight(p.position.x, p.position.z, 'person');
-    if (this.keys.up && p.position.y <= groundY + 0.02) {
+    if (jump && p.position.y <= groundY + 0.02) {
       p.verticalVel = 5.2;
     }
     p.verticalVel -= 14.5 * dt;
@@ -1159,14 +1213,18 @@ class ThirdPersonControllerManager {
     if (this.keys.left) turnInput = this.keys.left;
     if (this.keys.right) turnInput = -this.keys.right;
 
-    if (Math.abs(b.speed) > 0.15) {
-      const dirSign = b.speed >= 0 ? 1 : -1;
+    // Pedalling steers as well as rolling, so a bike held up against a wall can still be turned away from it
+    const rolling = Math.abs(b.speed) > 0.15;
+    if (rolling || throttle) {
+      const dirSign = (rolling ? b.speed : throttle) >= 0 ? 1 : -1;
       b.heading += turnInput * 2.15 * dirSign * dt;
     }
 
     b.position.x += Math.sin(b.heading) * b.speed * dt;
     b.position.z += Math.cos(b.heading) * b.speed * dt;
+    const movedX = b.position.x, movedZ = b.position.z;
     this.resolveHorizontalCollision(b.position, 0.65, null, b);
+    slideAlong(b, b.position.x - movedX, b.position.z - movedZ, dt);
     b.position.y = this.getGroundHeight(b.position.x, b.position.z, 'cyclist');
 
     const targetLean = -turnInput * Math.min(1.0, Math.abs(b.speed) / 9.0) * 0.34;
@@ -1202,8 +1260,12 @@ class ThirdPersonControllerManager {
     else if (this.keys.down) vertInput = -this.keys.down;
 
     if (fwdInput !== 0) {
-      h.speed += fwdInput * 24.0 * dt;
-      h.speed = Math.max(-maxHorizSpeed * 0.6, Math.min(maxHorizSpeed, h.speed));
+      // Releasing boost takes the extra thrust away: speed beyond the normal limits bleeds off as fast as boost built
+      // it up instead of snapping back to them
+      const thrust = 24.0 * dt;
+      const top = Math.max(maxHorizSpeed, h.speed - thrust);
+      const bottom = Math.min(-maxHorizSpeed * 0.6, h.speed + thrust);
+      h.speed = Math.max(bottom, Math.min(top, h.speed + fwdInput * thrust));
     } else {
       h.speed *= Math.max(0, 1 - dt * 1.8);
     }
@@ -1217,17 +1279,30 @@ class ThirdPersonControllerManager {
 
     h.heading += yawInput * 1.45 * dt;
 
+    const lastY = h.position.y;
     h.position.x += Math.sin(h.heading) * h.speed * dt;
     h.position.z += Math.cos(h.heading) * h.speed * dt;
     h.position.y += h.verticalSpeed * dt;
 
-    if (h.position.y < 0.25) {
-      this.reportCollision(h, groundCollider, 'ground', h.position.x, 0.25, h.position.z, 0, 1, 0, -h.verticalSpeed);
+    // Touching down or reaching the ceiling ends the descent or climb, so the collective answers at once. Only coming
+    // down onto the ground is an impact, not holding descend while resting on it
+    const floor = this.helicopterFloor(h.position.x, h.position.z);
+    if (h.position.y < floor) {
+      if (lastY > floor) {
+        this.reportCollision(h, groundCollider, 'ground', h.position.x, floor, h.position.z, 0, 1, 0, -h.verticalSpeed);
+      }
+      h.position.y = floor;
+      h.verticalSpeed = Math.max(0, h.verticalSpeed);
+    } else if (h.position.y > HELI_CEILING) {
+      h.position.y = HELI_CEILING;
+      h.verticalSpeed = Math.min(0, h.verticalSpeed);
     }
-    h.position.y = Math.max(0.25, Math.min(380, h.position.y));
+    const movedX = h.position.x, movedZ = h.position.z;
     this.resolveHorizontalCollision(h.position, 4.5, null, h);
+    slideAlong(h, h.position.x - movedX, h.position.z - movedZ, dt);
 
-    const targetPitch = (h.speed / maxHorizSpeed) * 0.24;
+    // Nose-down with speed (nose-up in reverse), no further while extra speed from boost bleeds off
+    const targetPitch = Math.max(-0.6, Math.min(1, h.speed / maxHorizSpeed)) * 0.24;
     const targetRoll = -yawInput * 0.28;
     h.pitchAngle += (targetPitch - h.pitchAngle) * Math.min(1, dt * 5);
     h.rollAngle += (targetRoll - h.rollAngle) * Math.min(1, dt * 5);

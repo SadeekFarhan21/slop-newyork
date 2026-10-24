@@ -47,8 +47,8 @@ function keyboardHarness(nyc = {}) {
     controller,
     window,
     document,
-    key(type, code, tagName = 'BODY') {
-      window.dispatch(type, { code, target: { tagName } });
+    key(type, code, tagName = 'BODY', event = {}) {
+      window.dispatch(type, { code, target: { tagName }, ...event });
     }
   };
 }
@@ -151,6 +151,45 @@ for (const interruption of ['blur', 'hidden', 'reset']) {
   });
 }
 
+test('Cmd and Ctrl shortcuts never move the player', () => {
+  const { controller, key } = keyboardHarness();
+  key('keydown', 'MetaLeft', 'BODY', { key: 'Meta', metaKey: true });
+  for (const code of ['KeyA', 'KeyE', 'ArrowUp', 'ShiftLeft']) key('keydown', code, 'BODY', { metaKey: true });
+  assert.equal(Object.values(controller.keys).some(Boolean), false, 'Cmd+A, Cmd+E, Cmd+Up and Cmd+Shift are shortcuts');
+  // macOS sends no keyup for A, E or Up let go while Cmd is down.
+  key('keyup', 'MetaLeft', 'BODY', { key: 'Meta' });
+  assert.equal(Object.values(controller.keys).some(Boolean), false);
+
+  key('keydown', 'ControlLeft', 'BODY', { key: 'Control', ctrlKey: true });
+  key('keydown', 'KeyW', 'BODY', { ctrlKey: true });
+  assert.equal(controller.keys.forward, false);
+  key('keyup', 'KeyW', 'BODY', { ctrlKey: true });
+  key('keyup', 'ControlLeft', 'BODY', { key: 'Control' });
+  key('keydown', 'KeyA');
+  assert.equal(controller.keys.left, true, 'plain presses still steer');
+});
+
+test('releasing Cmd drops held movement keys whose keyup macOS swallowed', () => {
+  const { controller, key } = keyboardHarness();
+  key('keydown', 'KeyW');
+  key('keydown', 'KeyD');
+  key('keydown', 'MetaLeft', 'BODY', { key: 'Meta', metaKey: true });
+  // Auto-repeat of a key held through Cmd changes nothing either way.
+  key('keydown', 'KeyW', 'BODY', { metaKey: true, repeat: true });
+  assert.equal(controller.keys.forward, true);
+  // W and D are let go while Cmd is down, so no keyup arrives for them.
+  key('keyup', 'MetaRight', 'BODY', { key: 'Meta' });
+  assert.equal(Object.values(controller.keys).some(Boolean), false);
+  assert.equal(controller._pressedCodes.size, 0);
+  key('keydown', 'KeyW');
+  assert.equal(controller.keys.forward, true, 'a fresh press drives again');
+
+  // Where the browser does deliver a release with Cmd held, it counts.
+  key('keydown', 'MetaLeft', 'BODY', { key: 'Meta', metaKey: true });
+  key('keyup', 'KeyW', 'BODY', { metaKey: true });
+  assert.equal(controller.keys.forward, false);
+});
+
 function advanceWithTouch(mode, strength, reverse) {
   const { controller } = keyboardHarness();
   const entity = { position: { x: 0, y: 0, z: 0 }, heading: 0, speed: 0 };
@@ -168,6 +207,8 @@ function advanceWithTouch(mode, strength, reverse) {
     verticalSpeed: 0, pitchAngle: 0, rollAngle: 0,
     tiltPivot: { rotation: { x: 0, z: 0 }, position: { y: 0 } }
   });
+  // Airborne, so that descending is not cut short by the ground
+  if (mode === 'Helicopter') entity.position.y = 100;
   controller.entities = { [mode.toLowerCase()]: entity };
   controller.getGroundHeight = () => 0;
   controller.resolveHorizontalCollision = () => {};
@@ -475,4 +516,344 @@ test('player clearance respects altitude and permits a ground arrival under an a
   assert.equal(ent.position.y, 0.22);
   helicopter.position.y = 1;
   assert.notDeepEqual({ ...controller.teleportActiveTo(0, 0) }, { x: 0, z: 0 }, 'a helicopter parked at street level must be avoided');
+});
+
+// All four players in a small world: sidewalks west of x = 0, Central Park's raised lawn around (-350, -350)
+function worldHarness(colliders = [], shore = () => ({ westX: -500, eastX: 500 })) {
+  const harness = keyboardHarness({
+    ISLAND_BOUNDS: { minX: -500, maxX: 500, minZ: -500, maxZ: 500, sidewalkHeight: 0.22 },
+    CENTRAL_PARK_BOUNDS: { minX: -400, maxX: -300, minZ: -400, maxZ: -300 },
+    getIslandBoundsAtZ: shore,
+    blockAt: (x) => (x < 0 ? { park: 0 } : null)
+  });
+  const { controller } = harness;
+  const position = (x = 0, y = 0, z = 0) => ({ x, y, z, copy(p) { this.x = p.x; this.y = p.y; this.z = p.z; } });
+  const pivot = () => ({ position: position(), rotation: { x: 0, y: 0, z: 0 } });
+  const crowd = () => ({ begin() {}, add() {}, end() {} });
+  const chain = { set: () => chain, applyQuaternion: () => chain, add: () => chain };
+  controller.entities = {
+    person: {
+      type: 'person', mesh: pivot(), crowd: crowd(), position: position(-5, 0.22, 0), heading: 0, speed: 0, verticalVel: 0,
+      chaseDistance: 4.3, chaseHeight: 1.95,
+      rig: { airs: [], reset() {}, update(...args) { this.airs.push(args[6]); } }
+    },
+    car: {
+      type: 'car', mesh: pivot(), chassisPivot: pivot(), carState: { value: { x: 0 } }, headLights: [],
+      wheels: [true, true, false, false].map((isFront) => ({ isFront, steerPivot: pivot(), tire: pivot() })),
+      position: position(5, 0, 0), heading: 0, speed: 0, vx: 0, vz: 0, angularVel: 0, pitchVel: 0, rollVel: 0,
+      heaveY: 0, heaveVel: 0, lastCollisionSpark: null, steerAngle: 0, wheelSpin: 0, chaseDistance: 6.9, chaseHeight: 2.12
+    },
+    cyclist: {
+      type: 'cyclist', mesh: pivot(), leanPivot: pivot(), frontWheel: pivot(), rearWheel: pivot(), crankPivot: pivot(),
+      pedals: [pivot(), pivot()], bikeFrame: {}, riderCrowd: crowd(), riderRig: { ride() {} },
+      helmet: { quaternion: { copy() {} }, position: chain }, headLight: { intensity: 0 },
+      position: position(10, 0, 20), heading: 0, speed: 0, leanAngle: 0, pedalPhase: 0, chaseDistance: 4.8, chaseHeight: 2.05
+    },
+    helicopter: {
+      type: 'helicopter', mesh: pivot(), tiltPivot: pivot(), mainRotorPivot: pivot(), tailRotorPivot: pivot(),
+      position: position(0, 100, -100), heading: 0, speed: 0, verticalSpeed: 0, pitchAngle: 0, rollAngle: 0,
+      chaseDistance: 11.4, chaseHeight: 3.3
+    }
+  };
+  controller.activeMode = 'car';
+  controller.colliders = colliders;
+  controller._colliderCells = null;
+  const run = (seconds, fps = 60) => {
+    for (let i = 0; i < Math.round(seconds * fps); i++) controller.update(1 / fps, i / fps);
+  };
+  return { ...harness, run };
+}
+
+test('the parked pedestrian stands where it was left instead of wandering off or hovering', () => {
+  const { controller, run } = worldHarness();
+  const person = controller.entities.person;
+  // At the curb, facing the roadway: walking on would leave it hovering at sidewalk height over the street.
+  Object.assign(person.position, { x: -0.3, y: 0.22, z: 0 });
+  person.heading = Math.PI / 2;
+  run(30);
+  assert.deepEqual([person.position.x, person.position.y, person.position.z], [-0.3, 0.22, 0]);
+  assert.equal(person.speed, 0);
+  assert.ok(person.rig.airs.every((air) => air === 0), 'the rig never takes the airborne pose');
+});
+
+test('a pedestrian left in mid-jump finishes the jump and lands where it is', () => {
+  const { controller, run } = worldHarness();
+  const person = controller.entities.person;
+  controller.activeMode = 'person';
+  controller.keys.up = true;
+  run(0.1);
+  controller.keys.up = false;
+  const [x, z, y] = [person.position.x, person.position.z, person.position.y];
+  assert.ok(person.verticalVel > 0 && y > 0.5, 'rising');
+  controller.setMode('car');
+  let peak = y;
+  for (let i = 0; i < 60; i++) {
+    controller.update(1 / 60, i / 60);
+    peak = Math.max(peak, person.position.y);
+  }
+  assert.ok(peak > y, 'the jump carries on to its top rather than stopping in mid-air');
+  assert.deepEqual([person.position.x, person.position.y, person.position.z], [x, 0.22, z]);
+  assert.equal(person.verticalVel, 0);
+  assert.equal(person.rig.airs.at(-1), 0, 'standing again once landed');
+});
+
+test('switching modes parks the player being left at rest where it is', () => {
+  const { controller, run } = worldHarness();
+  const { car, cyclist, helicopter, person } = controller.entities;
+  const drive = (mode) => {
+    controller.setMode(mode);
+    Object.assign(controller.keys, { forward: true, boost: true, left: true, up: mode === 'helicopter' });
+    run(1.5);
+    Object.assign(controller.keys, { forward: false, boost: false, left: false, up: false });
+  };
+
+  drive('car');
+  assert.ok(car.speed > 20 && car.steerAngle > 0.3 && car.chassisPivot.rotation.z !== 0);
+  car.lastCollisionSpark = { speed: 5 };
+  const parked = [car.position.x, car.position.y, car.position.z, car.heading];
+  controller.setMode('car');
+  assert.ok(car.speed > 20, 'reselecting the active mode leaves it moving');
+  drive('cyclist');
+  for (const field of ['speed', 'vx', 'vz', 'angularVel', 'steerAngle', 'pitchVel', 'rollVel', 'heaveY', 'heaveVel']) {
+    assert.equal(car[field], 0, field);
+  }
+  assert.deepEqual([car.chassisPivot.rotation.x, car.chassisPivot.rotation.z, car.chassisPivot.position.y], [0, 0, 0]);
+  assert.ok(car.wheels.every((wheel) => wheel.steerPivot.rotation.y === 0));
+  assert.equal(car.lastCollisionSpark, null, 'no stale crash sparks when the taxi is driven again');
+  assert.equal(car.carState.value.x, 1, 'brake lights show it standing');
+  assert.deepEqual([car.position.x, car.position.y, car.position.z, car.heading], parked);
+
+  assert.ok(cyclist.speed > 10 && cyclist.leanAngle !== 0);
+  drive('helicopter');
+  assert.deepEqual([cyclist.speed, cyclist.leanAngle, cyclist.leanPivot.rotation.z], [0, 0, 0]);
+  assert.ok(helicopter.speed > 20 && helicopter.verticalSpeed > 10 && helicopter.pitchAngle > 0);
+  const altitude = helicopter.position.y;
+  controller.setMode('person');
+  for (const field of ['speed', 'verticalSpeed', 'pitchAngle', 'rollAngle']) assert.equal(helicopter[field], 0, field);
+  assert.deepEqual([helicopter.tiltPivot.rotation.x, helicopter.tiltPivot.rotation.z], [0, 0]);
+  assert.equal(helicopter.position.y, altitude, 'it hovers where it was left');
+
+  Object.assign(controller.keys, { forward: true });
+  run(1);
+  controller.keys.forward = false;
+  assert.ok(person.speed > 3);
+  controller.setMode('car');
+  assert.equal(person.speed, 0);
+
+  // Coming back, the taxi waits where it was parked instead of lurching off at its old speed.
+  run(1);
+  assert.deepEqual([car.position.x, car.position.y, car.position.z, car.heading], parked);
+  assert.equal(car.speed, 0);
+});
+
+test('restoring saved players still lands each at rest at its saved spot', () => {
+  const { controller } = worldHarness();
+  const saved = {
+    person: { x: -40, y: 0.22, z: 60, heading: 1 },
+    car: { x: 40, y: 0, z: 60, heading: 2 },
+    cyclist: { x: 40, y: 0, z: -60, heading: 3 },
+    helicopter: { x: -40, y: 140, z: -60, heading: 0.5 }
+  };
+  // As main.js does on load, from the default taxi
+  for (const [mode, p] of Object.entries(saved)) {
+    controller.setMode(mode);
+    controller.teleportActiveTo(p.x, p.z, p.heading, p.y);
+  }
+  controller.setMode('cyclist');
+  assert.equal(controller.activeMode, 'cyclist');
+  for (const [mode, p] of Object.entries(saved)) {
+    const ent = controller.entities[mode];
+    assert.deepEqual([ent.position.x, ent.position.y, ent.position.z, ent.heading], [p.x, p.y, p.z, p.heading], mode);
+    assert.equal(ent.speed, 0);
+  }
+});
+
+for (const mode of ['cyclist', 'helicopter']) {
+  test(`a ${mode} driven into a wall stops instead of staying pinned at full speed`, () => {
+    for (const reverse of [false, true]) {
+      const { controller, run } = worldHarness([{ minX: -60, maxX: 60, minZ: 40, maxZ: 80, maxY: 400 }]);
+      controller.setMode(mode);
+      const ent = controller.entities[mode];
+      // Heading south from north of the wall, or backing north into it from the south
+      Object.assign(ent.position, { x: 0, z: reverse ? 120 : 0 });
+      ent.heading = 0;
+      const reports = [];
+      controller.setCollisionListener((event) => reports.push(event.speed));
+      Object.assign(controller.keys, { [reverse ? 'backward' : 'forward']: true, boost: true });
+      run(reverse ? 10 : 5);
+      assert.ok(reports.length > 0 && reports[0] > 3, 'it hits the wall');
+      assert.equal(Math.abs(ent.speed), 0, 'pinned against the wall the speed reads zero');
+      assert.equal(reports.length, 1, 'one impact, not a crash every frame while pinned');
+      if (mode === 'cyclist') {
+        const spin = ent.frontWheel.rotation.x, pedals = ent.pedalPhase;
+        run(0.5);
+        assert.ok(Math.abs(ent.frontWheel.rotation.x - spin) < 0.1 && ent.pedalPhase - pedals < 0.05, 'wheels and pedals stop');
+      }
+      // Steering free does not launch it at the speed it had when it hit.
+      Object.assign(controller.keys, { forward: false, backward: false, boost: false, left: true });
+      run(1);
+      assert.ok(Math.abs(ent.speed) < 0.5);
+    }
+  });
+
+  test(`a ${mode} scraping along a wall keeps most of its speed, alike at any frame rate`, () => {
+    const scrape = (degrees, fps) => {
+      // A long wall to the east, the player heading south and turned toward it, starting 1.5 m clear of it
+      const { controller } = worldHarness([{ minX: 8, maxX: 60, minZ: -450, maxZ: 450, maxY: 400 }]);
+      controller.setMode(mode);
+      const ent = controller.entities[mode];
+      Object.assign(ent.position, { x: 8 - (mode === 'helicopter' ? 4.5 : 0.65) - 1.5, z: -440 });
+      ent.heading = degrees * Math.PI / 180;
+      let hit = false, contact = null, total = 0, frames = 0;
+      controller.setCollisionListener(() => { hit = true; });
+      controller.keys.forward = true;
+      for (let i = 0; i < 8 * fps; i++) {
+        const before = ent.speed;
+        controller.update(1 / fps, i / fps);
+        if (hit && !contact) contact = { before, after: ent.speed };
+        if (i >= 7 * fps) { total += ent.speed; frames++; }
+      }
+      return { contact, steady: total / frames };
+    };
+    const glancing = scrape(3, 60);
+    assert.ok(glancing.contact && glancing.contact.after > glancing.contact.before * 0.99, 'a glancing scrape barely slows it');
+    const rates = [30, 60, 144].map((fps) => scrape(10, fps).steady);
+    const top = mode === 'helicopter' ? 32 : 12.8;
+    assert.ok(rates[1] > 3 && rates[1] < top * 0.6, 'pressing on into the wall drags it, but it still moves');
+    for (const steady of rates) assert.ok(Math.abs(steady / rates[1] - 1) < 0.06, `${rates} differ with the frame rate`);
+  });
+}
+
+test('a cyclist pedalling head-on against a wall steers away from it at any frame rate', () => {
+  for (const fps of [60, 120, 144]) {
+    for (const boost of [false, true]) {
+      const { controller } = worldHarness([{ minX: -60, maxX: 60, minZ: 40, maxZ: 80, maxY: 400 }]);
+      controller.setMode('cyclist');
+      const bike = controller.entities.cyclist;
+      Object.assign(bike.position, { x: 0, z: 0 });
+      bike.heading = 0;
+      Object.assign(controller.keys, { forward: true, boost });
+      for (let i = 0; i < 5 * fps; i++) controller.update(1 / fps, i / fps);
+      assert.ok(bike.speed < 0.2, 'held up against the wall');
+      // Pedalling on with left held, as when riding into a building at the end of a street
+      controller.keys.left = true;
+      let frames = 0, fastest = 0;
+      while (bike.heading < Math.PI / 2 && frames < fps) {
+        controller.update(1 / fps, frames++ / fps);
+        fastest = Math.max(fastest, bike.speed);
+      }
+      const label = `${fps} fps${boost ? ' with boost' : ''}`;
+      assert.ok(bike.heading >= Math.PI / 2, `${label}: it turns away from the wall while pedalling`);
+      assert.ok(fastest < 4, `${label}: it pulls away from rest instead of launching (${fastest} m/s)`);
+      controller.keys.left = false;
+      const x = bike.position.x;
+      for (let i = 0; i < fps; i++) controller.update(1 / fps, i / fps);
+      assert.ok(bike.speed > 6 && bike.position.x - x > 4, `${label}: and rides off along it`);
+    }
+  }
+});
+
+test('the shore pushes square to itself: a cyclist glances along a slanted shore and stops riding into it', () => {
+  // The east shore turned 26.6° from the street grid
+  const slanted = (z) => ({ westX: -500, eastX: 100 + 0.5 * z });
+  const lineX = (z) => slanted(z).eastX - 8;
+  const ride = (degrees) => {
+    const { controller, run } = worldHarness([], slanted);
+    controller.setMode('cyclist');
+    const bike = controller.entities.cyclist;
+    Object.assign(bike.position, { x: lineX(-300) - 0.5, z: -300 });
+    bike.heading = Math.atan2(0.5, 1) + degrees * Math.PI / 180;
+    bike.speed = 12.8;
+    controller.keys.forward = true;
+    run(3);
+    return bike;
+  };
+  const glancing = ride(2);
+  assert.ok(glancing.speed > 12.5, `2° into it, it keeps its speed (${glancing.speed} m/s)`);
+  assert.ok(Math.abs(glancing.position.x - lineX(glancing.position.z)) < 1e-6, 'running along the shore');
+  const headOn = ride(90);
+  assert.ok(headOn.speed < 0.2, `square into it, it stops (${headOn.speed} m/s)`);
+});
+
+test('a cyclist riding along the side of a pier slides on along it instead of being held in place', () => {
+  // A pier reaching 100 m further east for z >= 2: its side is a steep stretch of shore, almost along the cross street
+  const pier = (z) => ({ westX: -500, eastX: z < 0 ? 100 : z < 2 ? 100 + 50 * z : 200 });
+  const { controller, run } = worldHarness([], pier);
+  controller.setMode('cyclist');
+  const bike = controller.entities.cyclist;
+  // Due east along z = 1, whose shore line is reached at x = 142
+  Object.assign(bike.position, { x: 130, z: 1 });
+  bike.heading = Math.PI / 2;
+  bike.speed = 12.8;
+  controller.keys.forward = true;
+  run(1.5);
+  assert.ok(bike.position.x > 142 + 6 && bike.speed > 12, `it carries on along the pier's side (x ${bike.position.x})`);
+  run(5);
+  assert.ok(Math.abs(bike.position.x - 192) < 0.5 && bike.position.z > 1 && bike.position.z < 2.5, 'up to the pier end');
+  assert.ok(bike.speed < 0.2, 'where it stops, square against the shore');
+});
+
+test('the helicopter settles onto a raised park lawn and answers the collective at once at its limits', () => {
+  for (const fps of [20, 30, 60]) {
+    const { controller, run } = worldHarness();
+    controller.setMode('helicopter');
+    const heli = controller.entities.helicopter;
+    Object.assign(heli.position, { x: -350, y: 6, z: -350 });
+    const landings = [];
+    controller.setCollisionListener((event) => { if (event.kind === 'ground') landings.push({ y: event.y, speed: event.speed }); });
+    controller.keys.down = true;
+    run(3, fps);
+    assert.equal(heli.position.y, 1.24 + 0.25, 'the skids rest on the lawn, not a metre inside it');
+    assert.equal(heli.verticalSpeed, 0);
+    assert.equal(landings.length, 1, `one touchdown at ${fps} fps, however long descend is held`);
+    assert.ok(landings[0].y === heli.position.y && landings[0].speed > 10);
+    controller.keys.down = false;
+    controller.keys.up = true;
+    controller.update(1 / fps, 0);
+    assert.ok(heli.verticalSpeed > 0 && heli.position.y > 1.49, 'it lifts off on the first frame');
+
+    heli.position.y = 379;
+    run(2, fps);
+    assert.equal(heli.position.y, 380);
+    assert.equal(heli.verticalSpeed, 0);
+    controller.keys.up = false;
+    controller.keys.down = true;
+    controller.update(1 / fps, 0);
+    assert.ok(heli.position.y < 380, 'it descends from the ceiling on the first frame');
+  }
+});
+
+test('a helicopter restored onto a park lawn arrives above it', () => {
+  const { controller } = worldHarness();
+  controller.setMode('helicopter');
+  const heli = controller.entities.helicopter;
+  // An altitude saved while the floor ignored the park
+  assert.deepEqual({ ...controller.teleportActiveTo(-350, -350, 0, 0.25) }, { x: -350, z: -350 });
+  assert.equal(heli.position.y, 1.49);
+  controller.update(1 / 60, 0);
+  assert.equal(heli.position.y, 1.49);
+});
+
+test('releasing helicopter boost bleeds off the extra speed instead of snapping to the normal limit', () => {
+  for (const reverse of [false, true]) {
+    const { controller, run } = worldHarness();
+    controller.setMode('helicopter');
+    const heli = controller.entities.helicopter;
+    Object.assign(heli.position, { x: 0, y: 150, z: reverse ? 400 : -400 });
+    Object.assign(controller.keys, { [reverse ? 'backward' : 'forward']: true, boost: true });
+    run(3);
+    const [boosted, normal] = reverse ? [-52 * 0.6, -32 * 0.6] : [52, 32];
+    assert.ok(Math.abs(heli.speed - boosted) < 1e-9);
+    controller.keys.boost = false;
+    let previous = heli.speed;
+    for (let i = 0; i < 90; i++) {
+      controller.update(1 / 60, i / 60);
+      const change = Math.abs(heli.speed - previous);
+      assert.ok(change <= 24 / 60 + 1e-9, `one frame lost ${change} m/s`);
+      assert.ok(Math.abs(heli.speed) >= Math.abs(normal) - 1e-9, 'never below the normal limit while thrusting');
+      assert.ok(Math.abs(heli.pitchAngle) <= (reverse ? 0.6 : 1) * 0.24 + 1e-9, 'no extra nose-down (nose-up in reverse) while slowing');
+      previous = heli.speed;
+    }
+    assert.ok(Math.abs(heli.speed - normal) < 1e-9, 'settled on the normal limit');
+  }
 });
