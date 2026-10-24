@@ -1,6 +1,7 @@
 import { isTypingInField } from './city-config.js';
 
 const DEAD_ZONE = 0.15;
+const TRIGGER_DEAD_ZONE = 0.1;
 const BUTTON_COUNT = 17;
 
 function axis(value) {
@@ -17,6 +18,11 @@ function stick(pad, offset) {
 function buttonValue(pad, index) {
   const button = pad.buttons?.[index];
   return Number.isFinite(button?.value) ? Math.max(0, Math.min(1, button.value)) : button?.pressed ? 1 : 0;
+}
+
+// Analog triggers often rest a little above zero: ignore that, and rescale the rest of their travel to the full 0-1
+function trigger(pad, index) {
+  return Math.max(0, (buttonValue(pad, index) - TRIGGER_DEAD_ZONE) / (1 - TRIGGER_DEAD_ZONE));
 }
 
 function buttons(pad) {
@@ -147,9 +153,9 @@ class GamepadControls {
     let drive = -movement.y;
     let vertical = 0;
     if (mode === 'car' || mode === 'cyclist') {
-      drive = Math.max(0, drive, buttonValue(pad, 7)) - Math.max(0, -drive, buttonValue(pad, 6));
+      drive = Math.max(0, drive, trigger(pad, 7)) - Math.max(0, -drive, trigger(pad, 6));
     } else if (mode === 'helicopter') {
-      vertical = buttonValue(pad, 7) - buttonValue(pad, 6);
+      vertical = trigger(pad, 7) - trigger(pad, 6);
     }
     this.controller.setGamepadInput('forward', Math.max(0, drive));
     this.controller.setGamepadInput('backward', Math.max(0, -drive));

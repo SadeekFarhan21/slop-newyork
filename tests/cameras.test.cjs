@@ -217,6 +217,81 @@ for (const preset of ['chase', 'observatory', 'drone']) {
   });
 }
 
+test('the 5th Ave preset frames the Empire State Building down the avenue, in landscape and portrait', async () => {
+  const { LANDMARK_SITES, avenueX, streetZ } = await import('../js/city-config.js');
+  const esb = LANDMARK_SITES['Empire State Building'];
+  const h = cameraHarness();
+  for (const elapsed of [0, 2 * Math.PI, 6 * Math.PI]) { // the sway at rest and at both ends
+    h.camera.setCameraPreset('fifthAve', true);
+    h.camera.update(1 / 60, elapsed);
+    const { position: eye, target, fov } = h.camera.camera;
+    assert.ok(Math.abs(eye.x - avenueX('5')) < 8 && Math.abs(eye.z - streetZ(42)) < 40, 'on 5th Ave at 42nd St');
+    assert.ok(eye.y > 1.5 && eye.y < 12 && target.z > eye.z + 500, 'at street level, looking south down the avenue');
+    // camera basis (three.js: right = forward x up), then normalized device coordinates
+    const f = [target.x - eye.x, target.y - eye.y, target.z - eye.z];
+    const fl = Math.hypot(...f);
+    f.forEach((v, i) => { f[i] = v / fl; });
+    const rl = Math.hypot(f[2], f[0]);
+    const r = [-f[2] / rl, 0, f[0] / rl];
+    const u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
+    const t = Math.tan((fov * Math.PI) / 360);
+    for (const aspect of [16 / 9, 9 / 16]) {
+      // the spire, the 86th-floor setbacks and the shaft above the lower setbacks
+      for (const [x, y, z] of [[esb.x, 443, esb.z], [esb.x - 12, 320, esb.z - 14], [esb.x + 12, 320, esb.z - 14], [esb.x - 22, 150, esb.z - 16], [esb.x + 22, 150, esb.z - 16]]) {
+        const v = [x - eye.x, y - eye.y, z - eye.z];
+        const dot = (a) => a[0] * v[0] + a[1] * v[1] + a[2] * v[2];
+        const ndc = [dot(r) / (dot(f) * t * aspect), dot(u) / (dot(f) * t)];
+        assert.ok(Math.abs(ndc[0]) < 0.95 && Math.abs(ndc[1]) < 0.95, `${y} m of the tower in frame at ${aspect.toFixed(2)}: ${ndc.map((n) => n.toFixed(2))}`);
+      }
+    }
+  }
+});
+
+for (const preset of ['chase', 'action']) {
+  test(`the ${preset} camera rises with a climbing helicopter at any frame time, without it bobbing on screen`, () => {
+    const helicopter = {
+      position: new Vector3(0, 96, 100), heading: 0, speed: 0, verticalSpeed: 0, type: 'helicopter',
+      chaseDistance: 15, chaseHeight: 5, cameraTargetOffset: new Vector3(0, 1.4, 0)
+    };
+    const h = cameraHarness(helicopter);
+    h.camera.setCameraPreset(preset, true);
+    const frames = [1 / 60, 1 / 30, 1 / 120, 1 / 40, 1 / 60, 1 / 24, 1 / 90]; // an uneven mix, as on a busy display
+    let elapsed = 0;
+    const step = (i) => {
+      const dt = frames[i % frames.length];
+      helicopter.position.y += helicopter.verticalSpeed * dt; // the controller's step, as in updateHelicopter
+      elapsed += dt;
+      h.camera.update(dt, elapsed);
+      return { above: h.camera.camera.position.y - helicopter.position.y, look: h.camera.camera.target.y - helicopter.position.y };
+    };
+    let hover;
+    for (let i = 0; i < 400; i++) hover = step(i);
+
+    helicopter.verticalSpeed = 16; // full climb
+    const climbing = [];
+    for (let i = 0; i < 700; i++) {
+      const frame = step(i);
+      if (i >= 300) climbing.push(frame);
+    }
+    for (const field of ['above', 'look']) {
+      const values = climbing.map((frame) => frame[field]);
+      const spread = Math.max(...values) - Math.min(...values);
+      assert.ok(spread < 1e-6, `the camera ${field === 'above' ? 'height' : 'target'} keeps one place relative to the helicopter (spread ${spread} m)`);
+    }
+    // it still trails the climb, by climb / 8.5 m
+    assert.ok(Math.abs(hover.above - climbing[0].above - 16 / 8.5) < 1e-6, `trails a 16 m/s climb by ${hover.above - climbing[0].above} m`);
+
+    // a sudden change in height that isn't a climb (settling onto a raised lawn) is still eased, not snapped to
+    helicopter.verticalSpeed = 0;
+    for (let i = 0; i < 400; i++) step(i);
+    const before = h.camera.camera.position.y;
+    helicopter.position.y += 1.24;
+    h.camera.update(1 / 60, elapsed + 1 / 60);
+    const rise = h.camera.camera.position.y - before;
+    assert.ok(rise > 0 && rise < 1.24 * 0.2, `eases a 1.24 m step instead of jumping (${rise.toFixed(3)} m in one frame)`);
+  });
+}
+
 test('teleport releases every camera pointer and ignores old gestures before accepting a new drag', () => {
   const h = cameraHarness();
   h.pointer(h.canvas, 'pointerdown', 1, 0);

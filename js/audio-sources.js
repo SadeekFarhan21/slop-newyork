@@ -15,15 +15,15 @@ function driveLoad(keys, speed, cyclist) {
 }
 
 function helicopterVerticalSpeed(entity) {
-  const speed = Number.isFinite(entity.verticalSpeed) ? entity.verticalSpeed : 0;
-  // The controller clamps altitude without clearing its stored vertical velocity.
-  return (entity.position.y <= 0.25 && speed < 0) || (entity.position.y >= 380 && speed > 0) ? 0 : speed;
+  // The controller zeroes it on reaching the floor or the ceiling, so resting on either reads as still.
+  return Number.isFinite(entity.verticalSpeed) ? entity.verticalSpeed : 0;
 }
 
-function helicopterLoad(entity, keys, verticalSpeed) {
+// `floor` is the lowest the helicopter can fly where it is (raised over a park's lawn).
+function helicopterLoad(entity, keys, verticalSpeed, floor) {
   const forward = unit(+keys.forward) || -unit(+keys.backward);
   const collective = unit(+keys.up) || -unit(+keys.down);
-  const grounded = entity.position.y <= 0.35 && verticalSpeed <= 0.03;
+  const grounded = entity.position.y <= floor + 0.1 && verticalSpeed <= 0.03;
   return unit((grounded ? 0.12 : 0.45)
     + 0.28 * Math.max(collective, 0) - 0.16 * Math.max(-collective, 0)
     + 0.15 * unit(verticalSpeed / 16) - 0.08 * unit(-verticalSpeed / 16)
@@ -178,12 +178,14 @@ class CityAudioSources {
         const grounded = y <= ground + 0.03 && Math.abs(entity.verticalVel) < 0.1;
         this.person(entity, x, y, z, entity.rig.speed, grounded, entity.rig, true, player);
       } else {
-        // Inactive bicycles stop updating and are silent, even if their stored speed is left over from riding.
+        // A bicycle left behind is parked at rest and has no engine to idle, so it makes no sound.
         if (!player && entity.type === 'cyclist') continue;
         const kind = entity.type === 'car' ? 'sedan' : entity.type;
         const helicopter = kind === 'helicopter';
         const verticalSpeed = player && helicopter ? helicopterVerticalSpeed(entity) : 0;
-        const load = player ? helicopter ? helicopterLoad(entity, keys, verticalSpeed) : driveLoad(keys, entity.speed, kind === 'cyclist') : 0;
+        const load = !player ? 0
+          : helicopter ? helicopterLoad(entity, keys, verticalSpeed, this.controllers.helicopterFloor(x, z))
+            : driveLoad(keys, entity.speed, kind === 'cyclist');
         const gain = player ? 1 : helicopter ? 0.22 : 0.5;
         const range = helicopter ? (player ? 500 : 200) : 160;
         this.motor(entity, kind, x, y + (helicopter ? 2.66 : 0.7), z, player ? entity.speed : 0, load, entity.heading,

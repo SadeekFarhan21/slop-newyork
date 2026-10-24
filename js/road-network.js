@@ -1168,8 +1168,8 @@ function largestComponent(list, next) {
 }
 
 // Cubic Bézier from the end of lane i on edge e to the start of lane j on edge f: a quarter-circle-like
-// arc around the corner for turns, an S-bend for straight lane shifts. Includes an arc-length table and
-// the sharpest curvature along it (1 / tightest radius).
+// arc around the corner for turns, an S-bend for straight lane shifts. Includes an arc-length table, the
+// curvature (1 / radius) at each of its points and the sharpest curvature along it.
 function makeCurve(e, i, f, j) {
   const x0 = e.sx + e.dx * e.len + e.rx * e.lanes[i];
   const z0 = e.sz + e.dz * e.len + e.rz * e.lanes[i];
@@ -1190,6 +1190,7 @@ function makeCurve(e, i, f, j) {
     x1: x0 + e.dx * k0, z1: z0 + e.dz * k0,
     x2: x3 - f.dx * k3, z2: z3 - f.dz * k3,
     lut: new Float32Array(17),
+    bend: new Float32Array(17),
     len: 0,
     curv: 0
   };
@@ -1208,7 +1209,8 @@ function makeCurve(e, i, f, j) {
     const dz = 3 * u * u * (c.z1 - z0) + 6 * u * t * (c.z2 - c.z1) + 3 * t * t * (z3 - c.z2);
     const ddx = 6 * u * (c.x2 - 2 * c.x1 + x0) + 6 * t * (x3 - 2 * c.x2 + c.x1);
     const ddz = 6 * u * (c.z2 - 2 * c.z1 + z0) + 6 * t * (z3 - 2 * c.z2 + c.z1);
-    c.curv = Math.max(c.curv, Math.abs(dx * ddz - dz * ddx) / Math.max(1e-6, Math.hypot(dx, dz) ** 3));
+    c.bend[k] = Math.abs(dx * ddz - dz * ddx) / Math.max(1e-6, Math.hypot(dx, dz) ** 3);
+    c.curv = Math.max(c.curv, c.bend[k]);
   }
   return c;
 }

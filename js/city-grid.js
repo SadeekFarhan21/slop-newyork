@@ -428,6 +428,71 @@ function offsetPolygon(pts, d) {
   return out;
 }
 
+/**
+ * An outward offset (offsetPolygon) with the small loops cut off that it leaves where a short edge sits between two
+ * reflex corners (its offset turns back on itself and the neighbouring edges cross): each crossing takes the place of
+ * the vertices on its loop, so the outline stays simple for triangulation (ExtrudeGeometry)
+ */
+function untangleOffset(pts, span = 4) {
+  const out = pts.slice();
+  const cross = (o, a, b) => (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x);
+  for (let i = 0; i < out.length; i++) {
+    const n = out.length;
+    const a = out[i], b = out[(i + 1) % n];
+    for (let k = 2; k <= span && k < n - 2; k++) {
+      const c = out[(i + k) % n], d = out[(i + k + 1) % n];
+      const ca = cross(c, d, a), cb = cross(c, d, b);
+      if ((ca > 0) === (cb > 0) || (cross(a, b, c) > 0) === (cross(a, b, d) > 0)) continue;
+      const t = ca / (ca - cb);
+      // vertices i + 1 .. i + k (to the end of the array, the rest from its start) make way for the crossing
+      const first = (i + 1) % n;
+      const tail = Math.min(k, n - first);
+      out.splice(first, tail, { x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t });
+      out.splice(0, k - tail);
+      i = Math.max(-1, i - span - 1);
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Scanline queries on a large polygon ([{x, z}], e.g. the seawall), its edges bucketed by z so that each query reads
+ * only the few nearby: crossings(z) lists the x where edges cross the line through z (ascending), inside(x, z) is the
+ * even-odd test of pointInPolygonXZ
+ */
+function polygonScan(pts, bucket = 16) {
+  let z0 = Infinity;
+  for (const p of pts) z0 = Math.min(z0, p.z);
+  const buckets = [];
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const a = pts[j], b = pts[i];
+    const k1 = Math.floor((Math.max(a.z, b.z) - z0) / bucket);
+    for (let k = Math.floor((Math.min(a.z, b.z) - z0) / bucket); k <= k1; k++) (buckets[k] = buckets[k] || []).push(a, b);
+  }
+  const edgesAt = (z) => buckets[Math.floor((z - z0) / bucket)] || [];
+  return {
+    crossings(z) {
+      const list = edgesAt(z);
+      const out = [];
+      for (let i = 0; i < list.length; i += 2) {
+        const a = list[i], b = list[i + 1];
+        if ((a.z > z) !== (b.z > z)) out.push(a.x + ((z - a.z) * (b.x - a.x)) / (b.z - a.z));
+      }
+      return out.sort((p, q) => p - q);
+    },
+    inside(x, z) {
+      const list = edgesAt(z);
+      let inside = false;
+      for (let i = 0; i < list.length; i += 2) {
+        const a = list[i], b = list[i + 1];
+        if ((a.z > z) !== (b.z > z) && x < ((b.x - a.x) * (z - a.z)) / (b.z - a.z) + a.x) inside = !inside;
+      }
+      return inside;
+    }
+  };
+}
+
 function setPavingStyle(geo, style) {
   const uvAttr = geo.attributes.uv;
   for (let i = 0; i < uvAttr.count; i++) uvAttr.setXY(i, style, 0);
@@ -761,8 +826,151 @@ function pierHullGeometry(len, beam, depth, bowFrac = 0.28, sternFrac = 0.06, do
   return geo;
 }
 
+/** Scanline queries (polygonScan) on Manhattan's coastline, the edge of the land deck; built once */
+function coastlineScan() {
+  return coastlineScan.scan || (coastlineScan.scan = polygonScan(MANHATTAN_COASTLINE));
+}
+
+/**
+ * Where a waterfront pier (city-config.js WATERFRONT_PIERS) lies, for the pier builder and the esplanade along the
+ * bulkhead alike (cached per pier):
+ * - its frame: u seaward along the pier from its box's landward end, s across it (wx / wz: frame to world; rotation
+ *   about Y as in Object3D.rotation.y). Hudson piers without an outline run straight out along the cross streets, East
+ *   River ones stand perpendicular to the bulkhead.
+ * - u0: how far inland its body deck reaches to meet the bulkhead across its whole width (at most 40 m)
+ * - lands: an open park deck's landward end along the coastline where that runs askew to it (Pier 62's root runs along
+ *   the shore at 21°): points { u, s } from s = -hw to hw, instead of a square end at u0 running on over the land;
+ *   else null
+ * - roots: the rest of the pier's outline beyond the sides of its body (the deck box is the body's median width): the
+ *   wide roots of Piers 26, 57 & 76, the Chelsea Piers headhouse band. Each is a world polygon `poly`, carried landward
+ *   onto the bulkhead like the deck, and adjoins the body's `side` (-1 / 1, the side at s = side * hw) from u `from` to
+ *   `to`. Kinds that don't deck their whole body have none.
+ * - footprints: the world outlines of its decks (the body's, then the roots')
+ */
+function waterfrontPierLayout(p) {
+  const cache = waterfrontPierLayout.cache || (waterfrontPierLayout.cache = new WeakMap());
+  if (cache.has(p)) return cache.get(p);
+  const west = p.side === 'west';
+  const shoreAt = (z) => { const b = getIslandBoundsAtZ(z); return west ? b.westX : b.eastX; };
+  let theta = west ? Math.PI : Math.atan2(shoreAt(p.z + 14) - shoreAt(p.z - 14), 28);
+  let x0 = shoreAt(p.z);
+  let z0 = p.z;
+  if (p.angle !== undefined) {
+    // A real pier (city-config.js): its long axis, seaward toward the end further out in the river, the frame's origin
+    // at its landward end
+    let dx = Math.cos(p.angle);
+    let dz = Math.sin(p.angle);
+    const out = (x, z) => (west ? shoreAt(z) - x : x - shoreAt(z));
+    const h = p.length / 2;
+    if (out(p.cx + dx * h, p.cz + dz * h) < out(p.cx - dx * h, p.cz - dz * h)) { dx = -dx; dz = -dz; }
+    theta = Math.atan2(-dz, dx);
+    x0 = p.cx - dx * h;
+    z0 = p.cz - dz * h;
+  }
+  const c = Math.cos(theta), sn = Math.sin(theta);
+  const wx = (u, s) => x0 + u * c + s * sn;
+  const wz = (u, s) => z0 - u * sn + s * c;
+  const toFrame = (q) => ({ u: (q.x - x0) * c - (q.z - z0) * sn, s: (q.x - x0) * sn + (q.z - z0) * c });
+  const toWorld = (q) => ({ x: wx(q.u, q.s), z: wz(q.u, q.s) });
+  const inWater = (u, s) => { const x = wx(u, s), sx = shoreAt(wz(u, s)); return west ? x < sx : x > sx; };
+  const L = p.length, hw = p.width / 2;
+  let u0 = 0; // extend the deck inland until it meets the bulkhead across its whole width
+  for (const s of [-hw, 0, hw]) {
+    let u = 0;
+    while (u > -40 && inWater(u, s)) u -= 0.5;
+    u0 = Math.min(u0, u - 0.5);
+  }
+
+  // The coastline's edges near the pier, and where the line along s from u = ua toward ub first crosses one (its u)
+  const span = Math.max(L, hw * 2) + 60;
+  const coast = [];
+  for (let i = 0, j = MANHATTAN_COASTLINE.length - 1; i < MANHATTAN_COASTLINE.length; j = i++) {
+    const a = MANHATTAN_COASTLINE[j], b = MANHATTAN_COASTLINE[i];
+    if (Math.min(Math.hypot(a.x - x0, a.z - z0), Math.hypot(b.x - x0, b.z - z0)) < span + Math.hypot(b.x - a.x, b.z - a.z)) coast.push(a, b);
+  }
+  const coastAt = (s, ua, ub) => {
+    const ax = wx(ua, s), az = wz(ua, s), ex = wx(ub, s) - ax, ez = wz(ub, s) - az;
+    let best = Infinity;
+    for (let i = 0; i < coast.length; i += 2) {
+      const a = coast[i], b = coast[i + 1];
+      const fx = b.x - a.x, fz = b.z - a.z;
+      const den = ex * fz - ez * fx;
+      if (Math.abs(den) < 1e-9) continue;
+      const t = ((a.x - ax) * fz - (a.z - az) * fx) / den;
+      const v = ((a.x - ax) * ez - (a.z - az) * ex) / den;
+      if (t >= 0 && t <= 1 && v >= 0 && v <= 1) best = Math.min(best, t);
+    }
+    return best < Infinity ? ua + (ub - ua) * best : null;
+  };
+
+  // An open park deck meets the coastline along its line (half a metre onto the land, sampled every 2 m across) where
+  // that runs more than 3 m askew to it (kinds.park keeps its lawns, trees & benches off the land beside it). Decks
+  // carrying buildings or fields from their landward end keep it square, under them.
+  let lands = null;
+  if (p.kind === 'park') {
+    const n = Math.max(1, Math.ceil(hw));
+    const end = [];
+    for (let k = 0; k <= n; k++) {
+      const s = -hw + (k * hw * 2) / n;
+      const u = coastAt(s, L, u0);
+      end.push({ u: u === null ? u0 : Math.min(L - 1, Math.max(u0, u - 0.5)), s });
+    }
+    const us = end.map((q) => q.u);
+    if (Math.max(...us) - Math.min(...us) > 3) lands = end;
+  }
+
+  // Root slabs: the outline's excursions beyond either side of the body, its landward vertices carried onto the bulkhead
+  // and those within a metre of the body's sides moved onto them (the outline runs a little wider here and there)
+  const roots = [];
+  if (p.ring && !['vent', 'littleIsland', 'basin', 'whitehall'].includes(p.kind)) {
+    const scan = coastlineScan();
+    const ring = p.ring.map((q) => {
+      const f = toFrame(q);
+      if (f.u < 8 && !scan.inside(q.x, q.z)) {
+        const u = coastAt(f.s, f.u, f.u - 12);
+        if (u !== null) f.u = u - 0.5;
+      }
+      if (Math.abs(f.s) > hw && Math.abs(f.s) < hw + 1) f.s = Math.sign(f.s) * hw;
+      return f;
+    });
+    for (const side of [-1, 1]) {
+      const beyond = (q) => side * q.s > hw;
+      const cross = (a, b) => ({ u: a.u + ((b.u - a.u) * (side * hw - a.s)) / (b.s - a.s), s: side * hw });
+      const k0 = ring.findIndex((q) => !beyond(q));
+      if (k0 < 0) continue;
+      let piece = null;
+      for (let i = 0; i < ring.length; i++) {
+        const a = ring[(k0 + i) % ring.length], b = ring[(k0 + i + 1) % ring.length];
+        if (!beyond(a) && beyond(b)) piece = [cross(a, b)];
+        if (beyond(a) && !beyond(b)) {
+          piece.push(cross(a, b));
+          // slivers where the outline runs a little wider than the body's median width are left out
+          let area = 0, perim = 0;
+          for (let m = 0, n = piece.length - 1; m < piece.length; n = m++) {
+            area += piece[n].u * piece[m].s - piece[m].u * piece[n].s;
+            perim += Math.hypot(piece[m].u - piece[n].u, piece[m].s - piece[n].s);
+          }
+          area = Math.abs(area) / 2;
+          if (area > 25 && (2 * area) / perim > 1) {
+            const ua = piece[0].u, ub = piece[piece.length - 1].u;
+            roots.push({ poly: piece.map(toWorld), side, from: Math.min(ua, ub), to: Math.max(ua, ub) });
+          }
+          piece = null;
+        }
+        if (beyond(b)) piece.push(b);
+      }
+    }
+  }
+
+  const body = [...(lands || [{ u: u0, s: -hw }, { u: u0, s: hw }]), { u: L, s: hw }, { u: L, s: -hw }];
+  const layout = { west, theta, x0, z0, wx, wz, L, hw, u0, lands, roots, footprints: [body.map(toWorld), ...roots.map((r) => r.poly)] };
+  cache.set(p, layout);
+  return layout;
+}
+
 // Waterfront piers: builds every WATERFRONT_PIERS entry: concrete decks on timber piles with fenders, railings and
-// lamps, plus each pier's landmark structures. All static parts go through one batcher (~1 draw call per material).
+// lamps, plus each pier's landmark structures, and slabs decking the rest of each pier's outline beside its body. All
+// static parts go through one batcher (~1 draw call per material).
 function buildWaterfrontPiers(group) {
   const M = createWaterfrontPierMaterials();
   for (const [k, m] of Object.entries(M)) if (m && m.isMaterial) m.name = 'waterfrontPier.' + k;
@@ -794,6 +1002,8 @@ function buildWaterfrontPiers(group) {
         B.geo(mat, g, x0, 0, z0, theta, v);
       },
       tree: (u, s, y, r) => trees.push([wx(u, s), y, wz(u, s), r]),
+      // On Manhattan's land deck rather than out over the water or the seawall
+      onLand: (u, s) => coastlineScan().inside(wx(u, s), wz(u, s)),
       // Canvas-atlas lettering; rot = -PI/2 faces landward (-u), +PI/2 seaward (+u)
       sign: (text, u, y, s, height, rot) => {
         const r = M.signRects[text];
@@ -808,42 +1018,40 @@ function buildWaterfrontPiers(group) {
     };
   };
 
-  // Hudson piers run straight out along the cross streets; East River piers stand perpendicular to the bulkhead
+  // A pier's frame (waterfrontPierLayout): Hudson piers run straight out along the cross streets, East River piers stand
+  // perpendicular to the bulkhead, real ones along their own outline
   const pierFrame = (p) => {
-    const west = p.side === 'west';
-    const shoreAt = (z) => { const b = getIslandBoundsAtZ(z); return west ? b.westX : b.eastX; };
-    let theta = west ? Math.PI : Math.atan2(shoreAt(p.z + 14) - shoreAt(p.z - 14), 28);
-    let x0 = shoreAt(p.z);
-    let z0 = p.z;
-    if (p.angle !== undefined) {
-      // A real pier (city-config.js): its long axis, seaward toward the end further out in the river, the frame's origin
-      // at its landward end
-      let dx = Math.cos(p.angle);
-      let dz = Math.sin(p.angle);
-      const out = (x, z) => (west ? shoreAt(z) - x : x - shoreAt(z));
-      const h = p.length / 2;
-      if (out(p.cx + dx * h, p.cz + dz * h) < out(p.cx - dx * h, p.cz - dz * h)) { dx = -dx; dz = -dz; }
-      theta = Math.atan2(-dz, dx);
-      x0 = p.cx - dx * h;
-      z0 = p.cz - dz * h;
-    }
-    const F = frame(x0, z0, theta);
-    const inWater = (u, s) => { const x = F.wx(u, s), sx = shoreAt(F.wz(u, s)); return west ? x < sx : x > sx; };
-    let u0 = 0; // extend the deck inland until it meets the bulkhead across its whole width
-    for (const s of [-p.width / 2, 0, p.width / 2]) {
-      let u = 0;
-      while (u > -40 && inWater(u, s)) u -= 0.5;
-      u0 = Math.min(u0, u - 0.5);
-    }
-    return Object.assign(F, { L: p.length, hw: p.width / 2, u0, west });
+    const { x0, z0, theta, L, hw, u0, west, lands, roots } = waterfrontPierLayout(p);
+    return Object.assign(frame(x0, z0, theta), { L, hw, u0, west, lands, roots });
   };
+  // Flat slab over a world outline, h thick from y0 up (for the batcher, in world coordinates)
+  const slab = (pts, y0, h) => new THREE.ExtrudeGeometry(createWorldXZShape(pts), { depth: h, bevelEnabled: false, curveSegments: 1 })
+    .rotateX(-Math.PI / 2).translate(0, y0, 0);
 
-  // Steel pipe railing with posts every 3 m along both sides (+ optional seaward end)
-  const railing = (F, u0, u1, s0, s1, y, end = true) => {
-    for (const s of [s0 + 0.12, s1 - 0.12]) {
-      F.box(PA, u0, u1, y + 1.04, y + 1.1, s - 0.05, s + 0.05, 9);
-      F.box(PA, u0, u1, y + 0.52, y + 0.56, s - 0.02, s + 0.02, 9);
-      for (let u = u0; u <= u1 + 0.01; u += 3) F.box(PA, u - 0.04, u + 0.04, y, y + 1.06, s - 0.04, s + 0.04, 9, true);
+  // Steel pipe railing with posts every 3 m along both sides (+ optional seaward end). Along a pier's main deck it
+  // leaves out the stretches its root slabs adjoin (they carry it on round their own edges) and any over the land.
+  const railing = (F, u0, u1, s0, s1, y, end = true, main = false) => {
+    for (const [side, s] of [[-1, s0 + 0.12], [1, s1 - 0.12]]) {
+      const runs = [];
+      if (!main) runs.push([u0, u1]);
+      else {
+        let a = null;
+        for (let k = 0, n = Math.ceil((u1 - u0) / 0.5); k <= n; k++) {
+          const u = Math.min(u1, u0 + k * 0.5);
+          const open = !F.onLand(u, s) && !F.roots.some((r) => r.side === side && u > r.from && u < r.to);
+          if (open && a === null) a = u;
+          if ((!open || k === n) && a !== null) {
+            const b = open ? u : u - 0.5;
+            if (b - a >= 1) runs.push([a, b]);
+            a = null;
+          }
+        }
+      }
+      for (const [a, b] of runs) {
+        F.box(PA, a, b, y + 1.04, y + 1.1, s - 0.05, s + 0.05, 9);
+        F.box(PA, a, b, y + 0.52, y + 0.56, s - 0.02, s + 0.02, 9);
+        for (let u = a; u <= b + 0.01; u += 3) F.box(PA, u - 0.04, u + 0.04, y, y + 1.06, s - 0.04, s + 0.04, 9, true);
+      }
     }
     if (end) {
       const u = u1 - 0.12;
@@ -852,21 +1060,30 @@ function buildWaterfrontPiers(group) {
       for (let s = s0 + 3.1; s < s1 - 1; s += 3) F.box(PA, u - 0.04, u + 0.04, y, y + 1.06, s - 0.04, s + 0.04, 9, true);
     }
   };
-  // Hudson River Park lantern posts (glass heads glow at night)
+  // Hudson River Park lantern posts (glass heads glow at night), none on the land beside a deck
   const lamps = (F, u0, u1, s0, s1, y, spacing = 16) => {
     for (let u = u0; u <= u1; u += spacing) {
       for (const s of [s0, s1]) {
+        if (F.onLand(u, s)) continue;
         F.box(PA, u - 0.08, u + 0.08, y, y + 4.7, s - 0.08, s + 0.08, 9, true);
         F.box(PA, u - 0.2, u + 0.2, y + 4.25, y + 4.85, s - 0.2, s + 0.2, 10);
         F.box(PA, u - 0.27, u + 0.27, y + 4.85, y + 4.97, s - 0.27, s + 0.27, 9);
       }
     }
   };
-  // Pier deck on timber piles: concrete slab, shadowed under-deck, fender wales & piles, railings, lamps
+  // Pier deck on timber piles: concrete slab, shadowed under-deck, fender wales & piles, railings, lamps. A pier's main
+  // deck (its whole body from u0) ends along the coastline where its layout says so (F.lands).
   const deck = (F, u0, u1, s0, s1, o = {}) => {
     const y = o.y ?? DY;
-    F.box(GR, u0, u1, y - 0.85, y, s0, s1, o.surface ?? 0);
-    F.box(PA, u0 + 0.5, u1 - 0.5, -2.9, y - 0.85, s0 + 0.5, s1 - 0.5, 12);
+    const main = u0 === F.u0 && s0 === -F.hw && s1 === F.hw && !!F.roots;
+    if (main && F.lands) {
+      const outline = [...F.lands, { u: u1, s: s1 }, { u: u1, s: s0 }].map(({ u, s }) => ({ x: F.wx(u, s), z: F.wz(u, s) }));
+      B.geo(GR, slab(outline, y - 0.85, 0.85), 0, 0, 0, 0, o.surface ?? 0);
+      B.geo(PA, slab(offsetPolygonInward(outline, 0.5) || outline, -2.9, y + 2.05), 0, 0, 0, 0, 12);
+    } else {
+      F.box(GR, u0, u1, y - 0.85, y, s0, s1, o.surface ?? 0);
+      F.box(PA, u0 + 0.5, u1 - 0.5, -2.9, y - 0.85, s0 + 0.5, s1 - 0.5, 12);
+    }
     const ua = Math.max(u0, 2);
     F.box(PA, ua, u1, y - 1.3, y - 0.9, s0 - 0.32, s0 - 0.02, 8);
     F.box(PA, ua, u1, y - 1.3, y - 0.9, s1 + 0.02, s1 + 0.32, 8);
@@ -877,7 +1094,7 @@ function buildWaterfrontPiers(group) {
     if (o.endFender !== false) {
       for (let s = s0 + 1.2; s < s1 - 0.5; s += 4) F.box(PA, u1 + 0.09, u1 + 0.47, -3.0, y - 0.15, s - 0.19, s + 0.19, 8, true);
     }
-    if (o.rail !== false) railing(F, Math.max(u0, 1.5), u1, s0, s1, y, o.railEnd !== false);
+    if (o.rail !== false) railing(F, Math.max(u0, 1.5), u1, s0, s1, y, o.railEnd !== false, main);
     if (o.lamps) lamps(F, Math.max(u0, 0) + 7, u1 - 3, s0 + 1.0, s1 - 1.0, y, o.lamps);
   };
 
@@ -897,22 +1114,42 @@ function buildWaterfrontPiers(group) {
     group.add(mesh);
   };
 
-  // Hudson River Park lawn piers (84, 45, 66, 26): paver promenade, curbed lawn panels with trees, benches, shade sails
+  // Hudson River Park lawn piers (84, 45, 66, 26): paver promenade, curbed lawn panels with trees, benches, shade sails.
+  // Where the body reaches over the land beside a deck ending along the shore (Pier 62's root), lawns, trees and benches
+  // keep off it: a lawn panel standing partly on the land is split into halves, each cut back from its landward end.
   kinds.park = (F, p) => {
     const { L, hw } = F;
     deck(F, F.u0, L, -hw, hw, { lamps: 18, surface: 7 });
     const lw = hw - 3.4;
     const n = Math.max(2, Math.round((L - 22) / 22));
     const seg = (L - 22) / n;
+    const clear = (u0, u1, s0, s1) => [[u0, s0], [u0, s1], [u1, s0], [u1, s1], [(u0 + u1) / 2, (s0 + s1) / 2]].every(([u, s]) => !F.onLand(u, s));
     for (let i = 0; i < n; i++) {
       const a = 7 + i * seg + 1.2, b = 7 + (i + 1) * seg - 1.2;
-      F.box(GR, a - 0.3, b + 0.3, DY, DY + 0.32, -lw - 0.3, lw + 0.3, 0);
-      F.box(GR, a, b, DY, DY + 0.36, -lw, lw, 4);
+      let lawns = [[a, -lw, lw]];
+      if (!clear(a - 0.3, b + 0.3, -lw - 0.3, lw + 0.3)) {
+        lawns = [];
+        for (const [s0, s1] of [[-lw, -0.6], [0.6, lw]]) {
+          let ua = a;
+          while (ua < b - 6 && !clear(ua - 0.3, b + 0.3, s0 - 0.3, s1 + 0.3)) ua += 1;
+          if (clear(ua - 0.3, b + 0.3, s0 - 0.3, s1 + 0.3)) lawns.push([ua, s0, s1]);
+        }
+      }
+      for (const [ua, s0, s1] of lawns) {
+        F.box(GR, ua - 0.3, b + 0.3, DY, DY + 0.32, s0 - 0.3, s1 + 0.3, 0);
+        F.box(GR, ua, b, DY, DY + 0.36, s0, s1, 4);
+      }
       for (let u = a + 3; u < b - 2; u += 6.5 + rnd() * 3) {
-        for (const s of [-lw + 1.7, lw - 1.7]) if (rnd() < 0.8) F.tree(u, s + (rnd() - 0.5), DY + 0.36, 2.0 + rnd() * 1.4);
+        for (const s of [-lw + 1.7, lw - 1.7]) {
+          if (rnd() >= 0.8) continue;
+          const st = s + (rnd() - 0.5), r = 2.0 + rnd() * 1.4;
+          if (lawns.some(([ua, s0, s1]) => u >= ua + 1 && st > s0 + 0.5 && st < s1 - 0.5)) F.tree(u, st, DY + 0.36, r);
+        }
       }
     }
-    for (let u = 10; u < L - 16; u += 9) for (const s of [-hw + 2.1, hw - 2.1]) F.box(PA, u - 0.9, u + 0.9, DY, DY + 0.45, s - 0.3, s + 0.3, 7);
+    for (let u = 10; u < L - 16; u += 9) {
+      for (const s of [-hw + 2.1, hw - 2.1]) if (!F.onLand(u, s)) F.box(PA, u - 0.9, u + 0.9, DY, DY + 0.45, s - 0.3, s + 0.3, 7);
+    }
     const su = L - 9, sw = Math.min(7, hw - 2.2);
     for (const du of [-4, 4]) for (const s of [-sw, sw]) F.box(PA, su + du - 0.12, su + du + 0.12, DY, DY + 4.6, s - 0.12, s + 0.12, 9);
     F.strut(BL, [su - 5, DY + 4.3, 0], [su + 5, DY + 5.3, 0], 0.18, 6, sw * 2 + 1.6);
@@ -1284,7 +1521,8 @@ function buildWaterfrontPiers(group) {
     }
     top.computeVertexNormals();
     F.geo(GR, top, 0, 0, 0, 0, 4);
-    // Concrete rim skirt around the edge (pot rims), wound to face outward
+    // Concrete rim skirt around the edge (pot rims), wound to face outward: the quad t0-t1-b1 faces along (dz, -dx) for
+    // a rim edge P -> Q, so it is used where that points away from the middle of the park
     const ring = [];
     for (let ix = 0; ix <= NX; ix++) ring.push(ix);
     for (let iz = 1; iz <= NZ; iz++) ring.push(iz * (NX + 1) + NX);
@@ -1295,7 +1533,7 @@ function buildWaterfrontPiers(group) {
       const i = ring[k], j = ring[(k + 1) % ring.length];
       const P = [tp.getX(i), tp.getY(i), tp.getZ(i)], Q = [tp.getX(j), tp.getY(j), tp.getZ(j)];
       const out = (P[0] + Q[0]) / 2 - cu, outS = (P[2] + Q[2]) / 2;
-      const flip = (Q[2] - P[2]) * out - (Q[0] - P[0]) * outS < 0;
+      const flip = (Q[2] - P[2]) * out - (Q[0] - P[0]) * outS > 0;
       const t0 = [P[0], P[1] + 0.25, P[2]], t1 = [Q[0], Q[1] + 0.25, Q[2]], b0 = [P[0], P[1] - 2.3, P[2]], b1 = [Q[0], Q[1] - 2.3, Q[2]];
       const quad = flip ? [t0, t1, b1, t0, b1, b0] : [t0, b1, t1, t0, b0, b1];
       quad.forEach((v) => sk.push(...v));
@@ -1456,6 +1694,45 @@ function buildWaterfrontPiers(group) {
 
   for (const p of WATERFRONT_PIERS) (kinds[p.kind] || kinds.generic)(pierFrame(p), p);
 
+  // Root slabs (waterfrontPierLayout): the rest of each pier's outline beside its body, flush with its deck over the
+  // shadowed under-deck, railed along every edge open to the river (not on the land, nor against any pier's deck)
+  const decks = WATERFRONT_PIERS.flatMap((p) => waterfrontPierLayout(p).footprints);
+  const water = (x, z) => !coastlineScan().inside(x, z) && !decks.some((poly) => pointInPolygonXZ(poly, x, z));
+  for (const p of WATERFRONT_PIERS) {
+    const surface = p.kind === 'park' || p.kind === 'fields' ? 7 : 0;
+    for (const { poly } of waterfrontPierLayout(p).roots) {
+      B.geo(GR, slab(poly, DY - 0.85, 0.85), 0, 0, 0, 0, surface);
+      B.geo(PA, slab(offsetPolygonInward(poly, 0.5) || poly, -2.9, DY + 2.05), 0, 0, 0, 0, 12);
+      const inward = polygonCentroidArea(poly) > 0 ? 1 : -1; // the slab lies left of its edges (+1) or right (-1)
+      for (let i = 0; i < poly.length; i++) {
+        const a = poly[i], b = poly[(i + 1) % poly.length];
+        const len = Math.hypot(b.x - a.x, b.z - a.z);
+        if (len < 1) continue;
+        const dx = (b.x - a.x) / len, dz = (b.z - a.z) / len;
+        const E = frame(a.x, a.z, Math.atan2(-dz, dx)); // u along the edge, +s to its left
+        const s = inward * 0.12;
+        // metre by metre, open where the water lies 0.8 m beyond the edge
+        const open = [];
+        for (let u = 0; u < len; u += 1) {
+          const m = Math.min(u + 0.5, (u + len) / 2);
+          open.push(water(E.wx(m, -inward * 0.8), E.wz(m, -inward * 0.8)));
+        }
+        for (let k = 0; k < open.length;) {
+          if (!open[k]) { k++; continue; }
+          let j = k;
+          while (j < open.length && open[j]) j++;
+          const u0 = k, u1 = Math.min(j, len);
+          if (u1 - u0 >= 1) {
+            E.box(PA, u0, u1, DY + 1.04, DY + 1.1, s - 0.05, s + 0.05, 9);
+            E.box(PA, u0, u1, DY + 0.52, DY + 0.56, s - 0.02, s + 0.02, 9);
+            for (let u = u0; u <= u1 + 0.01; u += 3) E.box(PA, u - 0.04, u + 0.04, DY, DY + 1.06, s - 0.04, s + 0.04, 9, true);
+          }
+          k = j;
+        }
+      }
+    }
+  }
+
   // Park trees: trunks and lumpy low-poly crowns (one of three summer greens) join the paint batch: no extra draw calls
   if (trees.length) {
     const crownGeo = new THREE.IcosahedronGeometry(1, 1);
@@ -1510,11 +1787,9 @@ function buildCityGrid(scene) {
     metalness: 0.08
   });
 
-  // Slightly expanded perimeter polygon for the granite seawall & waterfront esplanade coping
-  const seawallPolygon = MANHATTAN_COASTLINE.map((p) => ({
-    x: p.x + (p.x < -100 ? -6 : (p.x > 100 ? 6 : 0)),
-    z: p.z + (p.z > 1350 ? 6 : (p.z < -1550 ? -6 : 0))
-  }));
+  // The granite seawall & its waterfront esplanade coping: the coastline (the road deck's edge) pushed 6 m out along its
+  // normals, so the coping runs beyond the deck on every stretch of shore, whichever way it faces
+  const seawallPolygon = untangleOffset(offsetPolygon(MANHATTAN_COASTLINE, -6));
   const seawallMesh = createExtrudedPolygonMesh(seawallPolygon, -2.35, 2.31, seawallMat, true, false);
   group.add(seawallMesh);
 
@@ -2513,7 +2788,7 @@ function buildCityGrid(scene) {
   // 9 & 10. The East River bridges, harbor islands and the surrounding boroughs are built by boroughs.js
 
   // 11. Manhattan's waterfront edge: esplanades, shore highways & riverside park belts (see buildManhattanWaterfrontEdge)
-  const highwayLanes = buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMat: cpLawnMat, curbMat, roadMat });
+  const highwayLanes = buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMat: cpLawnMat, curbMat, roadMat, seawall: seawallPolygon });
 
   // Batch static sub-meshes by material to reduce per-frame WebGPU draw calls
   batchStaticGroupMeshes(group, new Set([waterMat, roadMat, cpLawnMat, cpMeadowMat]));
@@ -2537,7 +2812,9 @@ function buildCityGrid(scene) {
  * that no AI traffic drives on) and the 6 m seawall coping beyond it, along both rivers from TriBeCa and the
  * Manhattan Bridge up to Harlem:
  * - The esplanade on the coping: iron railing along the water, the painted two-way greenway bikeway, NYC Parks
- *   lampposts and esplanade trees, with gaps where the pier decks meet the bulkhead
+ *   lampposts and esplanade trees, with gaps where the pier decks meet the bulkhead. It spans the coping's real width
+ *   along each row (wider than 6 m off a slanting shore), so the railing follows the seawall's edge; where the shore
+ *   steps out between two rows (pier stubs, coves) whatever would cut across the water is left out
  * - Route 9A / the Henry Hudson Parkway and the FDR Drive: 2 + 2 lanes with edge and lane paint, a Jersey barrier
  *   median under twin-arm highway lights, and a barrier along the greenway wherever no park separates them
  * - Lawn belts with granite curbs wherever the strip is wide enough: Hudson River Park (Midtown West, the highway
@@ -2548,10 +2825,11 @@ function buildCityGrid(scene) {
  * South of the Williamsburg Bridge the FDR leaves the strip for the South Street Viaduct (buildSouthStreetViaduct).
  * Everything is merged into a handful of meshes and keeps clear of the bridge towers standing near the shore.
  */
-function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMat, curbMat, roadMat }) {
+function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMat, curbMat, roadMat, seawall }) {
   const STEP = 3; // shore sampling (m of z)
   const HWY_W = 15.2; // 0.4 shoulder, 2 x 3.3 m lanes, 1.2 m median, 2 x 3.3 m lanes, 0.4 shoulder
   const COPING_Y = -0.04; // seawall coping top (section 2)
+  const COPING_W = 6; // seawall coping width out from the shore, along its normals (section 2)
   const LAWN_Y = 0.2;
   const UP = new THREE.Vector3(0, 1, 0);
   const hash = (a, b) => { const s = Math.sin(a * 12.9898 + b * 78.233) * 43758.5453; return s - Math.floor(s); };
@@ -2577,8 +2855,27 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
   }
   const z79 = streetZ(79);
   const gaps = [{ west: true, z0: z79 - 60, z1: z79 + 40, dMax: 4.5 }]; // the 79th St Boat Basin's gangways
-  for (const p of WATERFRONT_PIERS) gaps.push({ west: p.side === 'west', z0: p.z - p.width / 2 - 2.5, z1: p.z + p.width / 2 + 2.5, dMax: 4.5 });
-  const X = (r, d) => r.s + r.sgn * d;
+  // Each pier's decks (its body and root slabs, waterfrontPierLayout) cut through along the z span over which they reach
+  // the shore: their outlines out on the coping (at most 3 coping widths) or within dMax inland, 2.5 m to spare
+  for (const p of WATERFRONT_PIERS) {
+    const { west, footprints } = waterfrontPierLayout(p);
+    let z0 = Infinity, z1 = -Infinity;
+    for (const poly of footprints) {
+      for (let i = 0; i < poly.length; i++) {
+        const a = poly[i], b = poly[(i + 1) % poly.length];
+        const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.z - a.z) / 0.5));
+        for (let k = 0; k < n; k++) {
+          const x = a.x + ((b.x - a.x) * k) / n, z = a.z + ((b.z - a.z) * k) / n;
+          const d = west ? x - shoreX(z, true) : shoreX(z, false) - x;
+          if (d > -3 * COPING_W && d < 4.5) { z0 = Math.min(z0, z); z1 = Math.max(z1, z); }
+        }
+      }
+    }
+    if (z0 <= z1) gaps.push({ west, z0: z0 - 2.5, z1: z1 + 2.5, dMax: 4.5 });
+  }
+  // Offset d from the shore: inland in metres; out on the coping (d < 0) in the coping's own metres, stretched to its
+  // width along the row (r.cope: 1 off a shore square to the row, more off a slanting one or round a corner)
+  const X = (r, d) => r.s + r.sgn * (d < 0 ? d * r.cope : d);
   const H = (r, o) => r.d0 + o * r.k; // offset `o` across the highway section (squeezed where the strip is short)
   const inBox = (o, x, z) => {
     const dx = x - o.cx;
@@ -2588,9 +2885,21 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
   const blocked = (r, d) => towers.some((t) => inBox(t, X(r, d), r.z)) ||
     gaps.some((g) => g.west === r.west && r.z > g.z0 && r.z < g.z1 && d < g.dMax);
 
-  // Rows every STEP m of z: shore x `s`, inland sign `sgn` (x = s + sgn * d) and the strip width W to the nearest raised
-  // sidewalk block (cross-street gaps take their neighbours'), min-filtered then smoothed so lanes and belts flow along
-  // the shore. landF(z) slides the highway from the river side (0) to the block side (1); the park belts take the rest.
+  // The seawall (section 2): coping pieces must stand on it (onSeawall), a run of them stops before a segment leaving it
+  // anywhere along its length (sampled every 0.5 m), and each row's coping reaches out to the first crossing of its outer
+  // face beyond the shore
+  const seawallScan = polygonScan(seawall);
+  const onSeawall = (x, z) => seawallScan.inside(x, z);
+  const overWater = (a, b) => {
+    const n = Math.ceil(Math.hypot(b.x - a.x, b.z - a.z) / 0.5);
+    for (let k = 1; k < n; k++) if (!onSeawall(a.x + ((b.x - a.x) * k) / n, a.z + ((b.z - a.z) * k) / n)) return true;
+    return false;
+  };
+
+  // Rows every STEP m of z: shore x `s`, inland sign `sgn` (x = s + sgn * d), the coping's width along the row (`cope`,
+  // in COPING_W, at most 3) and the strip width W to the nearest raised sidewalk block (cross-street gaps take their
+  // neighbours'), min-filtered then smoothed so lanes and belts flow along the shore. landF(z) slides the highway from
+  // the river side (0) to the block side (1); the park belts take the rest.
   function sampleShore(west, z0, z1, landF) {
     const sgn = west ? 1 : -1;
     const edgeD = (b, s) => (west ? b.cx - b.w / 2 - s : s - b.cx - b.w / 2);
@@ -2600,7 +2909,9 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
       const s = shoreX(z, west);
       let W = 40;
       for (const b of near) if (Math.abs(z - b.cz) < b.d / 2 + 9) W = Math.min(W, edgeD(b, s));
-      rows.push({ z, s, sgn, west, raw: W });
+      let reach = Infinity;
+      for (const x of seawallScan.crossings(z)) if (sgn * (s - x) > 0) reach = Math.min(reach, sgn * (s - x));
+      rows.push({ z, s, sgn, west, raw: W, cope: reach < Infinity ? Math.min(3, Math.max(1, reach / COPING_W)) : 1 });
     }
     const n = rows.length;
     const at = (i) => rows[Math.min(n - 1, Math.max(0, i))];
@@ -2658,21 +2969,26 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
       A.uv.push(u, v);
     }
   }
-  // Runs of consecutive usable rows: fn(i, a, b, startsRun, endsRun) for every segment between rows i and i + 1
-  function runs(pts, fn) {
+  // Runs of consecutive usable rows: fn(i, a, b, startsRun, endsRun) for every segment between rows i and i + 1 (a
+  // segment `cut(i)` rules out ends the run there)
+  function runs(pts, fn, cut = null) {
+    const ok = pts.map((p, i) => !!(p && pts[i + 1]) && !(cut && cut(i)));
     for (let i = 0; i + 1 < pts.length; i++) {
-      if (pts[i] && pts[i + 1]) fn(i, pts[i], pts[i + 1], !pts[i - 1], !pts[i + 2]);
+      if (ok[i]) fn(i, pts[i], pts[i + 1], !ok[i - 1], !ok[i + 1]);
     }
   }
 
-  // Lane paint (createRoadPaintMaterial attributes, as in js/road-paint.js), dashes continuing along each run
+  // Lane paint (createRoadPaintMaterial attributes, as in js/road-paint.js), dashes continuing along each run (the
+  // greenway's lines on the coping only over the seawall)
   const WHITE = new THREE.Color(0xe6e2d6);
   const YELLOW = new THREE.Color(0xe8ad22);
   const paint = { pos: [], side: [], paint: [], col: [], idx: [] };
   function paintLine(rows, dOf, w, col, period = 1, duty = 1) {
-    const pts = rows.map((r) => {
-      const d = dOf(r);
-      return d === null || d > r.W - 0.3 ? null : P(r, d, (d < 0 ? COPING_Y : 0) + 0.012);
+    const ds = rows.map(dOf);
+    const pts = rows.map((r, i) => {
+      const d = ds[i];
+      if (d === null || d > r.W - 0.3 || (d < 0 && !onSeawall(X(r, d), r.z))) return null;
+      return P(r, d, (d < 0 ? COPING_Y : 0) + 0.012);
     });
     let u = 0;
     runs(pts, (i, a, b, start) => {
@@ -2689,7 +3005,7 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
       }
       paint.idx.push(k, k + 1, k + 2, k, k + 2, k + 3);
       u += len;
-    });
+    }, (i) => ds[i] < 0 && overWater(pts[i], pts[i + 1]));
   }
 
   // New Jersey-shape concrete barrier (half-width, height profile) along dOf(row), capped at both ends of every run
@@ -2764,7 +3080,7 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
   // Black iron esplanade railing along the outer edge of the coping (alpha-tested pickets, uv.x = metres along)
   const fence = makeAcc();
   function railing(rows, d) {
-    const pts = rows.map((r) => (blocked(r, d) ? null : P(r, d, COPING_Y)));
+    const pts = rows.map((r) => (blocked(r, d) || !onSeawall(X(r, d), r.z) ? null : P(r, d, COPING_Y)));
     let u = 0;
     runs(pts, (i, a, b, start) => {
       if (start) u = 0;
@@ -2772,7 +3088,7 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
       const top = COPING_Y + 1.1;
       quad(fence, a, b, b.clone().setY(top), a.clone().setY(top), new THREE.Vector3(-rows[i].sgn, 0, 0), u, u + len);
       u += len;
-    });
+    }, (i) => overWater(pts[i], pts[i + 1]));
   }
 
   // Trees: staggered, jittered rows across the belts (with glades), and a single row along the esplanade
@@ -2801,12 +3117,12 @@ function buildManhattanWaterfrontEdge(group, { blockSidewalks, treeSites, lawnMa
     for (let zt = z0 + 4; zt <= z1; zt += 16) {
       const z = zt + (hash(zt, 3.1) - 0.5) * 3;
       const r = rows[Math.round((z - z0) / STEP)];
-      if (!r || r.river || blocked(r, -4.4)) continue;
+      if (!r || r.river || blocked(r, -4.4) || !onSeawall(X(r, -4.4), z)) continue;
       treeSites.push({ x: X(r, -4.4), y: COPING_Y, z, scale: 0.8 + hash(z, 7.7) * 0.25, species: hash(z, 1.9) < 0.6 ? 0 : 1, tier: 1 });
     }
     for (let z = z0 + 12; z <= z1; z += 26) {
       const r = rows[Math.round((z - z0) / STEP)];
-      if (r && !blocked(r, -3.55)) lampSpots.push([X(r, -3.55), COPING_Y, r.z, 0]);
+      if (r && !blocked(r, -3.55) && onSeawall(X(r, -3.55), r.z)) lampSpots.push([X(r, -3.55), COPING_Y, r.z, 0]);
     }
   }
 

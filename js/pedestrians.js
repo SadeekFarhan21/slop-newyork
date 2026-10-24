@@ -3,12 +3,14 @@ import {
   Fn,
   float,
   int,
+  ivec2,
   vec2,
   vec3,
   color,
   attribute,
   instanceIndex,
   attributeArray,
+  textureLoad,
   normalLocal,
   varying,
   cross,
@@ -31,7 +33,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 //   skeleton, with bind-pose morphs for build (girth), female proportions and hair volume & length; a near and a far
 //   level of detail.
 // - A whole crowd is one instanced draw per level of detail: every person's bone transforms (quaternion, translation &
-//   scale) live in a storage buffer the vertex stage skins from, and a per-person seed dresses them (TSL material).
+//   scale) live in a storage buffer (a float texture on WebGL2) the vertex stage skins from, and a per-person seed
+//   dresses them (TSL material).
 // - PersonRig walks a body along whatever path its owner moves it on: footsteps are planted in the world (heel strike,
 //   foot flat, heel-off & toe-off rolling over a toe joint), so feet never slide; two-bone IK bends hips & knees to
 //   reach them, the pelvis rides as high as the planted legs allow (the inverted pendulum's bob), and the pelvis
@@ -59,7 +62,7 @@ const BONE = {
   TOE_R: 14
 };
 const BONE_COUNT = 15;
-// vec4s per person in the pose buffer: (quaternion) and (translation, scale) per bone, then (seed, female, girth, hair)
+// vec4s per person in the pose table: (quaternion) and (translation, scale) per bone, then (seed, female, girth, hair)
 const STRIDE = BONE_COUNT * 2 + 1;
 
 // Bind pose (metres, a 1.75 m person standing at the origin facing +Z, +X on their left): legs straight down, arms
@@ -744,15 +747,14 @@ function pickColorFromPalette(hexArray, tNode) {
 const qrot = (q, v) => v.add(cross(q.xyz, cross(q.xyz, v).add(v.mul(q.w))).mul(2.0));
 
 /**
- * Material for one crowd mesh. `pose` is its storage buffer (STRIDE vec4s per instance). The vertex stage morphs the
- * bind pose (girth, female, hair) and skins it with two bones; the fragment stage dresses the person from their seed:
- * skin tone, hair & hairline, eyes, brows & mouth, a tailored jacket (lapels, shirt V) or casual coat (zip, hem,
- * collar), cuffs, trousers, sneakers or leather shoes with soles & laces.
+ * Material for one crowd mesh. `pose` is its PoseTable (STRIDE vec4s per instance). The vertex stage morphs the bind
+ * pose (girth, female, hair) and skins it with two bones; the fragment stage dresses the person from their seed: skin
+ * tone, hair & hairline, eyes, brows & mouth, a tailored jacket (lapels, shirt V) or casual coat (zip, hem, collar),
+ * cuffs, trousers, sneakers or leather shoes with soles & laces.
  */
 function createPersonMaterial(pose) {
   const mat = new THREE.MeshStandardNodeMaterial({ metalness: 0 });
-  const base = int(instanceIndex).mul(STRIDE);
-  const info = pose.element(base.add(STRIDE - 1)); // seed, female, girth, hair
+  const info = pose.element(STRIDE - 1); // seed, female, girth, hair
 
   mat.positionNode = Fn(() => {
     const skin = attribute('skin', 'vec4');
@@ -765,8 +767,8 @@ function createPersonMaterial(pose) {
       .add(attribute('hairDelta', 'vec3').mul(hairAmount));
     const n = attribute('normal', 'vec3');
     const w = skin.z;
-    const ia = base.add(int(skin.x).mul(2));
-    const ib = base.add(int(skin.y).mul(2));
+    const ia = int(skin.x).mul(2);
+    const ib = int(skin.y).mul(2);
     const qa = pose.element(ia);
     const ta = pose.element(ia.add(1));
     const qb = pose.element(ib);
@@ -891,6 +893,52 @@ function createPersonMaterial(pose) {
 // ============================================================================
 // 4. CROWD: ONE INSTANCED, SKINNED DRAW PER LEVEL OF DETAIL
 // ============================================================================
+const POSE_LAYER = 16; // people per layer of a WebGL2 pose texture: each frame re-uploads just the layers in use
+
+/**
+ * The bone transforms of up to `maxCount` people (STRIDE vec4s each, laid out as PersonRig.pose), rewritten every frame.
+ * WebGPU skins from a storage buffer and uploads just the people drawn. three.js's WebGL2 backend can't index a storage
+ * buffer (its fallback reads one element per vertex, at the vertex's index), so there the same floats are an RGBA32F
+ * array texture: a row of STRIDE texels per person, POSE_LAYER people per layer. Each backend's shaders read only their
+ * own copy, so only that one is ever uploaded.
+ */
+class PoseTable {
+  constructor(maxCount) {
+    // at most 256 layers (all WebGL2 guarantees): bigger crowds get taller ones
+    this.perLayer = Math.min(maxCount, Math.max(POSE_LAYER, Math.ceil(maxCount / 256)));
+    const layers = Math.ceil(maxCount / this.perLayer);
+    this.buffer = attributeArray(layers * this.perLayer * STRIDE, 'vec4').toReadOnly();
+    this.array = this.buffer.value.array;
+    this.texture = new THREE.DataArrayTexture(this.array, STRIDE, this.perLayer, layers);
+    this.texture.type = THREE.FloatType;
+    this.texture.needsUpdate = true; // the warm-up person (see PersonCrowd) draws from the zeroed texture
+    // where the instance's pose starts: its first vec4 in the buffer, its row & layer in the texture (shared nodes, so
+    // the shader computes them once)
+    const person = int(instanceIndex);
+    this.start = person.mul(STRIDE);
+    this.row = person.mod(this.perLayer);
+    this.layer = person.div(this.perLayer);
+  }
+
+  // vec4 `column` of the instance's pose, from whichever copy the backend compiling the shader can read
+  element(column) {
+    return Fn((builder) => {
+      if (builder.isAvailable('storageBuffer')) return this.buffer.element(this.start.add(column));
+      return textureLoad(this.texture, ivec2(column, this.row)).depth(this.layer);
+    }, 'vec4')();
+  }
+
+  // Upload the poses of the first `count` people
+  update(count) {
+    const attr = this.buffer.value;
+    attr.clearUpdateRanges();
+    attr.addUpdateRange(0, count * STRIDE * 4);
+    attr.needsUpdate = true;
+    for (let i = 0, layers = Math.ceil(count / this.perLayer); i < layers; i++) this.texture.addLayerUpdate(i);
+    this.texture.needsUpdate = true;
+  }
+}
+
 class PersonCrowd {
   /**
    * @param {number} maxCount - most people drawn at once
@@ -899,7 +947,7 @@ class PersonCrowd {
   constructor(maxCount, { farDistance = 34, castShadow = true } = {}) {
     this.farDistance = farDistance;
     this.lods = [1, 0].map((detail) => {
-      const pose = attributeArray(maxCount * STRIDE, 'vec4').toReadOnly();
+      const pose = new PoseTable(maxCount);
       const mesh = new THREE.Mesh(buildPersonGeometry(detail), createPersonMaterial(pose));
       mesh.name = detail ? 'PeopleNear' : 'PeopleFar';
       mesh.count = 1; // one (degenerate) person until the first frame, so the pipelines compile up front
@@ -918,18 +966,14 @@ class PersonCrowd {
   add(rig, distance = 0) {
     const l = this.lods[distance > this.farDistance ? 1 : 0];
     if (l.count >= l.max) return;
-    l.pose.value.array.set(rig.pose, l.count * STRIDE * 4);
+    l.pose.array.set(rig.pose, l.count * STRIDE * 4);
     l.count++;
   }
 
   end() {
     for (const l of this.lods) {
       l.mesh.count = l.count;
-      if (l.count === 0) continue;
-      const attr = l.pose.value;
-      attr.clearUpdateRanges();
-      attr.addUpdateRange(0, l.count * STRIDE * 4);
-      attr.needsUpdate = true;
+      if (l.count > 0) l.pose.update(l.count);
     }
   }
 }

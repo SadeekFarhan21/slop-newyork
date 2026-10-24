@@ -1,10 +1,14 @@
 import * as THREE from 'three/webgpu';
-import { Fn, float, color, positionWorld, uniform, mod, fract, step, smoothstep, mix } from 'three/tsl';
+import { Fn, float, color, positionWorld, uniform, mod, fract, step, smoothstep, mix, attribute, texture, uv } from 'three/tsl';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   AVENUES,
+  ALL_AVENUES,
   STREETS,
   streetZ,
+  avenueX,
+  avenueNameAt,
+  getBroadwayX,
   SIGNAL_TIMING,
   blockAt,
   fromOldFrame,
@@ -19,31 +23,234 @@ import { bryantParkLawn } from './landmarks.js';
 
 // js/street-details.js
 // Populates Manhattan streets with authentic NYC street furniture using InstancedMesh:
-// - Cantilevered NYC Yellow Traffic Signals at all 63 intersections
+// - Cantilevered NYC Yellow Traffic Signals at all 63 intersections, each mast carrying its corner's street name blades
 // - NYC DOT Cobra-head LED Streetlights
 // - Con Edison Orange/White Steam Stacks + Volumetric TSL Rising Steam Plumes
 // - MTA Subway Stair Entrances with Glowing Green Globe Lamps
 // - NYC Hot Dog / Halal Street Carts with Blue & Yellow Umbrellas
 // - Fire Hydrants, USPS Mailboxes, Litter Baskets, and Park/Street Trees
 
-function createStreetSignBladeTexture(label) {
-  const c = document.createElement('canvas');
-  c.width = 256;
-  c.height = 64;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#0d6b3f';
-  ctx.fillRect(0, 0, 256, 64);
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = 5;
-  ctx.strokeRect(4, 4, 248, 56);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '800 30px Inter, Arial, sans-serif';
+// =====================================================================================================================
+// NYC DOT STREET NAME BLADES
+// Every signal mast carries a green blade for each street at its corner: two perpendicular blades, each parallel to the
+// street it names (and a third along Broadway where it crosses the intersection). The names come from city-config.js;
+// each distinct name is lettered once into a single-channel atlas and every blade instance picks its cell with an
+// instanced attribute, so all of the city's blades are one draw.
+// =====================================================================================================================
+const SIGN_BLADE_H = 0.34; // blade height (m)
+const SIGN_BLADE_T = 0.03; // sheet & bracket thickness (m)
+const SIGN_LETTER_H = SIGN_BLADE_H * 0.5; // capital height (m)
+const SIGN_MARGIN = 0.11; // blade end to lettering (m), the border included
+const SIGN_CONDENSE = 0.76; // condensed capitals: the face squeezed to at most this share of its natural width
+const SIGN_CELL_W = 640; // atlas cell (px), wide enough for the longest blade
+const SIGN_CELL_H = 128; // the blade's height in texels: about one per pixel from ~3 m away
+const SIGN_BLADE_MAX = (SIGN_BLADE_H * SIGN_CELL_W) / SIGN_CELL_H; // 1.7 m, so the texels stay square
+const SIGN_BLADE_MIN = 0.6;
+const SIGN_ATLAS_MAX = 4096;
+const SIGN_BORDER = { inset: 5, line: 4, radius: 12 }; // white border just inside the blade's edge (px at SIGN_CELL_H)
+const SIGN_FONT = "Overpass, Inter, 'Helvetica Neue', Arial, sans-serif"; // the HUD's Highway Gothic signs (style.css)
+const SIGN_FONT_FACE = '700 64px Overpass';
+const SIGN_GREEN = 0x0b6a46;
+const SIGN_WHITE = 0xf4f6f2;
+const SIGN_Y = 4.65; // the lowest blade's middle on the mast (m), the others stacked above it
+const SIGN_PITCH = 0.38;
+const SIGN_MOUNT_R = 0.12; // mast axis to the blades' inner ends (m): flush with the 0.14 m mast
+const BROADWAY_HALF_W = 7; // Broadway's half roadway (m)
+// Advance widths of the sign face (Overpass Bold) in capital heights, for blade lengths without a canvas (1 otherwise)
+const SIGN_ADVANCE = {
+  A: 1.03, B: 0.99, C: 0.92, D: 1.02, E: 0.9, F: 0.83, G: 0.98, H: 1.04, I: 0.43, J: 0.8, K: 1.02, L: 0.81, M: 1.16,
+  N: 1.03, O: 1.04, P: 0.92, Q: 1.04, R: 0.99, S: 0.88, T: 0.87, U: 1.02, V: 0.98, W: 1.22, X: 0.97, Y: 0.98, Z: 0.92,
+  0: 0.95, 1: 0.58, 2: 0.88, 3: 0.86, 4: 0.92, 5: 0.88, 6: 0.88, 7: 0.77, 8: 0.9, 9: 0.88,
+  ' ': 0.36, '-': 0.6, "'": 0.35, '/': 0.75, '&': 1.02
+};
+const SIGN_ABBREVIATIONS = { AVENUE: 'AV', AVE: 'AV', STREET: 'ST', BOULEVARD: 'BLVD', PLACE: 'PL', DRIVE: 'DR', LANE: 'LN', ROAD: 'RD' };
+
+/** A street's name as lettered on its blade: capitals, "AV", no ordinals ("W 34 ST", "5 AV", "PARK AV S", "BROADWAY") */
+function streetSignText(name) {
+  const words = String(name).toUpperCase().replace(/\./g, '').trim().split(/\s+/);
+  return words.map((w, i) => {
+    if (SIGN_ABBREVIATIONS[w]) return SIGN_ABBREVIATIONS[w];
+    if ((w === 'EAST' || w === 'WEST') && /^\d/.test(words[i + 1] || '')) return w[0];
+    return w.replace(/^(\d+)(?:ST|ND|RD|TH)$/, '$1');
+  }).join(' ');
+}
+
+/** Blade length (m) for a legend: NYC blades are cut to their names (the lettering is fitted to it when drawn) */
+function streetSignLength(text) {
+  let advance = 0;
+  for (const ch of text) advance += SIGN_ADVANCE[ch] ?? 1;
+  return Math.min(SIGN_BLADE_MAX, Math.max(SIGN_BLADE_MIN, advance * SIGN_LETTER_H * SIGN_CONDENSE + SIGN_MARGIN * 2));
+}
+
+// The avenue's name where it meets the street at z (Park Ave is Park Ave S below 32nd St)
+function avenueSignName(ave, z) {
+  const named = ALL_AVENUES.find((a) => a.segs && Math.abs(a.x - ave.x) < 1);
+  return named ? avenueNameAt(named, z) : ave.name;
+}
+
+/**
+ * The name blades on the signal mast at (px, pz) on a `corner` (sz: its side of the street, armDir: the mast arm's x
+ * direction) of AVENUES `ave` x STREETS `st`, each parallel to the street it names: the cross street's reaching toward
+ * the avenue under the arm, the avenue's above it reaching toward the cross street and, where Broadway's diagonal
+ * crosses as well (Times & Herald Squares), one along Broadway on top. Numbered streets are East or West by the side of
+ * 5th Ave. [{ text, length, x, y, z, yaw }]: yaw turns the blade's long (x) axis.
+ */
+function cornerSignBlades(ave, st, px, pz, corner) {
+  const blades = [];
+  const add = (name, dx, dz) => {
+    const text = streetSignText(name);
+    const length = streetSignLength(text);
+    const r = SIGN_MOUNT_R + length * 0.5;
+    blades.push({ text, length, x: px + dx * r, y: SIGN_Y + blades.length * SIGN_PITCH, z: pz + dz * r, yaw: Math.atan2(-dz, dx) });
+  };
+  add(st.number ? `${px < avenueX('5') ? 'W' : 'E'} ${st.name}` : st.name, corner.armDir, 0);
+  add(avenueSignName(ave, st.z), 0, -corner.sz);
+  // Broadway's roadway overlapping the avenue's at this street
+  if (Math.abs(getBroadwayX(st.z) - ave.x) < ave.width * 0.5 + BROADWAY_HALF_W) {
+    // along Broadway's centreline (dz = 40 m), the end reaching into the intersection
+    const dx = getBroadwayX(st.z + 20) - getBroadwayX(st.z - 20);
+    const s = (dx * (ave.x - px) + 40 * (st.z - pz) < 0 ? -1 : 1) / Math.hypot(dx, 40);
+    add('Broadway', dx * s, 40 * s);
+  }
+  return blades;
+}
+
+/**
+ * Atlas layout for the blades lettered `texts` (one per blade instance): a cell per distinct name in the squarest grid
+ * that fits SIGN_ATLAS_MAX (halving the cells rather than outgrowing it), each name's art drawn from its cell's left
+ * edge at its blade's length. `rects` holds every instance's texture rect (u, v, du, dv; v up, canvas rows down).
+ */
+function planStreetSignAtlas(texts) {
+  const names = [...new Set(texts)];
+  let cellW = SIGN_CELL_W * 2;
+  let cellH = SIGN_CELL_H * 2;
+  let cols;
+  let rows;
+  do {
+    cellW /= 2;
+    cellH /= 2;
+    cols = Math.max(1, Math.min(Math.floor(SIGN_ATLAS_MAX / cellW), Math.ceil(Math.sqrt((names.length * cellH) / cellW))));
+    rows = Math.max(1, Math.ceil(names.length / cols));
+  } while (rows * cellH > SIGN_ATLAS_MAX && cellH > 8);
+  const width = cols * cellW;
+  const height = rows * cellH;
+  const cells = new Map();
+  names.forEach((text, i) => {
+    const x = (i % cols) * cellW;
+    const y = Math.floor(i / cols) * cellH;
+    const length = streetSignLength(text);
+    const w = (cellW * length) / SIGN_BLADE_MAX;
+    cells.set(text, { text, length, x, y, w, h: cellH, u: x / width, v: 1 - (y + cellH) / height, du: w / width, dv: cellH / height });
+  });
+  const rects = new Float32Array(texts.length * 4);
+  texts.forEach((text, i) => {
+    const c = cells.get(text);
+    rects[i * 4] = c.u;
+    rects[i * 4 + 1] = c.v;
+    rects[i * 4 + 2] = c.du;
+    rects[i * 4 + 3] = c.dv;
+  });
+  return { width, height, cellW, cellH, cells, rects };
+}
+
+/** Letters an atlas: the white border & capitals on black (the green), each legend condensed to fit its blade */
+function drawStreetSignAtlas(ctx, atlas) {
+  const k = atlas.cellH / SIGN_CELL_H;
+  const capH = (SIGN_LETTER_H / SIGN_BLADE_H) * atlas.cellH;
+  const margin = (SIGN_MARGIN / SIGN_BLADE_H) * atlas.cellH;
+  const inset = (SIGN_BORDER.inset + SIGN_BORDER.line * 0.5) * k; // the border's centreline
+  const radius = SIGN_BORDER.radius * k;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, atlas.width, atlas.height);
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = SIGN_BORDER.line * k;
+  // the face sized by its capitals
+  ctx.font = `700 100px ${SIGN_FONT}`;
+  const capRatio = ctx.measureText('H').actualBoundingBoxAscent / 100 || 0.7;
+  ctx.font = `700 ${(capH / capRatio).toFixed(2)}px ${SIGN_FONT}`;
   ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(label, 128, 34);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
+  ctx.textBaseline = 'alphabetic';
+  for (const c of atlas.cells.values()) {
+    const x0 = c.x + inset;
+    const y0 = c.y + inset;
+    const x1 = c.x + c.w - inset;
+    const y1 = c.y + c.h - inset;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.beginPath();
+    ctx.moveTo(x0 + radius, y0);
+    ctx.arcTo(x1, y0, x1, y1, radius);
+    ctx.arcTo(x1, y1, x0, y1, radius);
+    ctx.arcTo(x0, y1, x0, y0, radius);
+    ctx.arcTo(x0, y0, x1, y0, radius);
+    ctx.closePath();
+    ctx.stroke();
+    const condense = Math.min(SIGN_CONDENSE, (c.w - margin * 2) / Math.max(1, ctx.measureText(c.text).width));
+    ctx.setTransform(condense, 0, 0, 1, c.x + c.w * 0.5, c.y + (c.h + capH) * 0.5);
+    ctx.fillText(c.text, 0, 0);
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+// The atlas as a single-channel texture (the legend's coverage: 0 green, 1 white), lettered again once the sign face
+// (a web font) has loaded
+function createStreetSignAtlasTexture(atlas) {
+  const { width, height } = atlas;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const coverage = new Uint8Array(width * height);
+  const tex = new THREE.DataTexture(coverage, width, height, THREE.RedFormat, THREE.UnsignedByteType);
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = 4;
+  const letter = () => {
+    drawStreetSignAtlas(ctx, atlas);
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+    // canvas rows run top-down, texture rows bottom-up
+    for (let y = 0; y < height; y++) {
+      const src = (height - 1 - y) * width * 4;
+      const dst = y * width;
+      for (let x = 0; x < width; x++) coverage[dst + x] = rgba[src + x * 4];
+    }
+    tex.needsUpdate = true;
+  };
+  letter();
+  if (document.fonts && !document.fonts.check(SIGN_FONT_FACE)) {
+    document.fonts.load(SIGN_FONT_FACE).then((faces) => {
+      if (faces.length) letter();
+    }, () => {});
+  }
   return tex;
+}
+
+// Blade: a box whose two faces carry the legend (box uvs read correctly from both sides); its ends & edges sample the
+// green rim outside the border instead of a sliver of lettering
+function createStreetSignBladeGeometry() {
+  const geo = new THREE.BoxGeometry(1, 1, 1);
+  const uvs = geo.attributes.uv;
+  const normals = geo.attributes.normal;
+  const rimV = SIGN_BORDER.inset / 2 / SIGN_CELL_H;
+  for (let i = 0; i < uvs.count; i++) if (Math.abs(normals.getZ(i)) < 0.5) uvs.setXY(i, 0.5, rimV);
+  return geo;
+}
+
+/**
+ * Blades lettered `texts` (one per instance, in order) for a single instanced mesh: the blade geometry with each
+ * instance's atlas rect as its `signCell` attribute, and the material lettering every blade from its own cell
+ */
+function createStreetSignBlades(texts) {
+  const atlas = planStreetSignAtlas(texts);
+  const geometry = createStreetSignBladeGeometry();
+  geometry.setAttribute('signCell', new THREE.InstancedBufferAttribute(atlas.rects, 4));
+  const material = new THREE.MeshStandardNodeMaterial({ roughness: 0.32 });
+  const cell = attribute('signCell', 'vec4');
+  const legend = texture(createStreetSignAtlasTexture(atlas), uv().mul(cell.zw).add(cell.xy)).r;
+  material.colorNode = mix(color(SIGN_GREEN), color(SIGN_WHITE), legend);
+  return { geometry, material, atlas };
 }
 
 /**
@@ -137,10 +344,6 @@ function buildStreetDetails(scene) {
   lampBulbGlow.colorNode = mix(color(0x8f918c), color(0xfff1d6).mul(2.1), smoothstep(0.4, 1.1, cityUniforms.uInteriorGlow));
   const pedGlobeGlow = new THREE.MeshBasicNodeMaterial();
   pedGlobeGlow.colorNode = mix(color(0xd4d2c8), color(0xffe4b0).mul(1.95), smoothstep(0.4, 1.1, cityUniforms.uInteriorGlow));
-  const streetBladeMat = new THREE.MeshStandardNodeMaterial({
-    map: createStreetSignBladeTexture('5TH AVE · 42 ST'),
-    roughness: 0.32
-  });
 
   // 12-inch three-section signal head (origin at its centre, y = 5.42): yellow housing, a tunnel visor over each lens
   // and a hanger to the mast arm, lenses on both faces (+-z) so it reads from both approaches; the lens material
@@ -183,6 +386,7 @@ function buildStreetDetails(scene) {
   const aveLensMatrices = [];
   const streetLensMatrices = [];
   const streetBladeMatrices = [];
+  const streetBladeTexts = [];
   const walkBoxMatrices = [];
   const audioSignals = [];
   const lampHeadMatrices = [];
@@ -263,11 +467,17 @@ function buildStreetDetails(scene) {
         dummy.updateMatrix();
         poleMatrices.push(dummy.matrix.clone());
 
-        // NYC DOT Green Street Name Sign Blade mounted on pole (y = 4.65m)
-        dummy.position.set(px + c.armDir * 0.68, 4.65, pz);
-        dummy.scale.set(1.38, 0.34, 0.08);
-        dummy.updateMatrix();
-        streetBladeMatrices.push(dummy.matrix.clone());
+        // NYC DOT green street name blades flag-mounted on the pole (from y = 4.65m), one per street at this corner,
+        // each parallel to the street it names
+        for (const blade of cornerSignBlades(ave, st, px, pz, c)) {
+          dummy.position.set(blade.x, blade.y, blade.z);
+          dummy.rotation.set(0, blade.yaw, 0);
+          dummy.scale.set(blade.length, SIGN_BLADE_H, SIGN_BLADE_T);
+          dummy.updateMatrix();
+          streetBladeMatrices.push(dummy.matrix.clone());
+          streetBladeTexts.push(blade.text);
+        }
+        dummy.rotation.set(0, 0, 0);
 
         // Pedestrian "WALK / DON'T WALK" signal on the pole at crosswalk level (y = 3.15m), facing across the street
         dummy.position.set(px + c.armDir * 0.24, 3.15, pz);
@@ -492,7 +702,12 @@ function buildStreetDetails(scene) {
   addMatrixArrayInstanced(signalHousingGeo, signalHousingMat, yellowBoxMatrices);
   addMatrixArrayInstanced(signalLensGeo, aveSignalLensMat, aveLensMatrices, false);
   addMatrixArrayInstanced(signalLensGeo, streetSignalLensMat, streetLensMatrices, false);
-  addMatrixArrayInstanced(unitBox, streetBladeMat, streetBladeMatrices);
+  if (streetBladeTexts.length) {
+    // every blade in one draw, each lettered from its name's atlas cell
+    const { geometry, material, atlas } = createStreetSignBlades(streetBladeTexts);
+    addMatrixArrayInstanced(geometry, material, streetBladeMatrices);
+    console.info(`[streetDetails] ${streetBladeTexts.length} street name blades (${atlas.cells.size} names, ${atlas.width}x${atlas.height} atlas)`);
+  }
   addMatrixArrayInstanced(walkHousingGeo, signalHousingMat, walkBoxMatrices);
   addMatrixArrayInstanced(walkPanelGeo, walkSignalGlow, walkBoxMatrices, false);
   addMatrixArrayInstanced(lampHousingGeo, poleMetalMat, lampHeadMatrices);
@@ -1042,7 +1257,9 @@ function buildStreetDetails(scene) {
     pitSoilInst.setMatrixAt(i, dummy.matrix);
   });
   gratedTrees.forEach((t, i) => {
+    // a whole transform per grate: the shared dummy still holds the last pit's turn & narrowing
     dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
     dummy.position.set(t.x, 0.225, t.z);
     dummy.updateMatrix();
     pitGrateInst.setMatrixAt(i, dummy.matrix);
@@ -1206,4 +1423,4 @@ function buildStreetDetails(scene) {
   return { group, footprints, signalClock, audioSignals, update };
 }
 
-export { buildStreetDetails };
+export { buildStreetDetails, streetSignText, streetSignLength, cornerSignBlades, planStreetSignAtlas, drawStreetSignAtlas };

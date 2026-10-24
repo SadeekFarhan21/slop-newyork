@@ -19,9 +19,7 @@ import {
   length,
   fwidth,
   uniform,
-  texture,
-  time,
-  instanceIndex
+  texture
 } from 'three/tsl';
 import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 
@@ -889,19 +887,33 @@ function buildLightbarGeometry(spec = BODY_SPECS.sedan) {
   return mergeGeometries(parts);
 }
 
+// Light bar timing, shared by the lenses (createLightbarMaterial) and the lights they cast (traffic.js): LIGHTBAR_RATE
+// cycles a second, each flashing the red (-x) half three times and then the blue (+x) half three times, every car
+// offset by a phase (0-1) of its own
+const LIGHTBAR_RATE = 1.6;
+const LIGHTBAR_FLASHES = 6; // per cycle
+
+// Which half is lit `cycle` (0-1) into the shared cycle, for a car of phase `phase`: -1 red, 1 blue, 0 neither
+function lightbarFlash(cycle, phase) {
+  const t = (cycle + phase) % 1;
+  return (t * LIGHTBAR_FLASHES) % 1 < 0.5 ? 0 : t < 0.5 ? -1 : 1;
+}
+
 let _lightbarMat = null;
 
-// Light bar lenses: red & blue halves flashing in alternation (double strobes), each car on its own phase
+// Light bar lenses: red & blue halves flashing in alternation (triple strobes) as lightbarFlash() tells, from the
+// shared cycle (the material.userData.cycle uniform, which the owner advances) and each instance's `strobePhase`
+// attribute, so a car keeps its timing whichever instance slot it is drawn in
 function createLightbarMaterial() {
   if (_lightbarMat) return _lightbarMat;
   const mat = new THREE.MeshStandardNodeMaterial({ roughness: 0.18, metalness: 0.1 });
+  const cycle = uniform(0);
   const lightbar = () => {
     const p = attribute('position', 'vec3');
     const partId = attribute('partId', 'float');
     const isLens = step(abs(partId.sub(CAR_PARTS.SIGN)), 0.25);
-    const phase = fract(float(instanceIndex).mul(0.61803)).toVar();
-    const t = fract(time.mul(1.6).add(phase)).toVar();
-    const strobe = step(0.5, fract(t.mul(6.0)));
+    const t = fract(cycle.add(attribute('strobePhase', 'float'))).toVar();
+    const strobe = step(0.5, fract(t.mul(LIGHTBAR_FLASHES)));
     const redOn = step(t, 0.5).mul(strobe);
     const blueOn = step(0.5, t).mul(strobe);
     const isRed = step(p.x, -0.035);
@@ -917,6 +929,7 @@ function createLightbarMaterial() {
     const s = lightbar();
     return color(0xff1a22).mul(s.isRed.mul(s.redOn).mul(6.0)).add(color(0x2a6cff).mul(s.isBlue.mul(s.blueOn).mul(7.0))).mul(s.isLens);
   })();
+  mat.userData.cycle = cycle;
   _lightbarMat = mat;
   return mat;
 }
@@ -2044,6 +2057,8 @@ export {
   createLoftedCarMaterial,
   buildLightbarGeometry,
   createLightbarMaterial,
+  LIGHTBAR_RATE,
+  lightbarFlash,
   BUS_SPEC,
   buildLoftedBusBodyGeometry,
   buildBusSignGeometry,

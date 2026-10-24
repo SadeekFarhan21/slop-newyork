@@ -16,17 +16,10 @@ for (const p of parksRaw) {
   const acres = parseFloat(p.acres || '0');
   parks.push({ name: p.signname || p.name311 || '', cat: p.typecategory || '', acres, rings });
 }
-// Coverage of every block by park land: scanline-fill each park ring over the block raster
+// Coverage of every block by park land: scanline-fill each park ring over the block raster, counting the cells under
+// each block's raster label
 const W = R.w, H = R.h;
-const parkCells = new Float64Array(blocks.length + 1);
-// blocks don't carry their raster label: recover it from a point inside each block's lot rect or polygon
-for (const b of blocks) {
-  const r = b.rects[0];
-  const [cx, cz] = r ? [(r[0] + r[1]) / 2, (r[2] + r[3]) / 2] : centroid(b.poly);
-  const i = Math.floor((cx - R.x0) / R.res), j = Math.floor((cz - R.z0) / R.res);
-  b._lab = i >= 0 && j >= 0 && i < W && j < H ? lab[j * W + i] : 0;
-}
-const byLab = new Map(blocks.map((b) => [b._lab, b]));
+const byLab = new Map(blocks.map((b) => [b.lab, b]));
 const parkOf = new Map(); // block -> { name, cells }
 for (const pk of parks) {
   if (pk.acres < 0.25) continue;
@@ -107,26 +100,66 @@ log(`${parkShapes.length} park outlines kept`);
 // Piers: OSM pier polygons off Manhattan's bulkhead (outside the island, touching or near it)
 // ---------------------------------------------------------------------------------------------------------------------
 function orientedBox(ring) {
-  // minimum-area rectangle over the hull edges' directions
-  let best = null;
-  for (let i = 0; i < ring.length; i++) {
-    const [x0, z0] = ring[i], [x1, z1] = ring[(i + 1) % ring.length];
+  // Minimum-area rectangle over the edges' directions, out of those most of the outline runs along or across (within
+  // 3°) if there are any: a pier's sides set its heading. Pier 62 widens into a root whose north side runs at 21° to
+  // the deck, and its minimum-area box over every direction lies 8° off the pier, along 3% of its outline. A rounded
+  // outline (Little Island) has no such direction and keeps that box.
+  const COS3 = Math.cos((3 * Math.PI) / 180);
+  const n = ring.length;
+  let perim = 0;
+  for (let i = 0; i < n; i++) perim += Math.hypot(ring[(i + 1) % n][0] - ring[i][0], ring[(i + 1) % n][1] - ring[i][1]);
+  let best = null, bestSides = null;
+  for (let i = 0; i < n; i++) {
+    const [x0, z0] = ring[i], [x1, z1] = ring[(i + 1) % n];
     const L = Math.hypot(x1 - x0, z1 - z0);
     if (L < 1) continue;
     const ux = (x1 - x0) / L, uz = (z1 - z0) / L;
-    let a0 = Infinity, a1 = -Infinity, b0 = Infinity, b1 = -Infinity;
-    for (const [x, z] of ring) {
+    let a0 = Infinity, a1 = -Infinity, b0 = Infinity, b1 = -Infinity, sides = 0;
+    for (let k = 0; k < n; k++) {
+      const [x, z] = ring[k], [xn, zn] = ring[(k + 1) % n];
       const a = x * ux + z * uz, b = -x * uz + z * ux;
       a0 = Math.min(a0, a); a1 = Math.max(a1, a); b0 = Math.min(b0, b); b1 = Math.max(b1, b);
+      const ex = xn - x, ez = zn - z, el = Math.hypot(ex, ez);
+      if (Math.max(Math.abs(ex * ux + ez * uz), Math.abs(ez * ux - ex * uz)) > el * COS3) sides += el;
     }
-    const area = (a1 - a0) * (b1 - b0);
-    if (!best || area < best.area) best = { area, ux, uz, a0, a1, b0, b1 };
+    const box = { area: (a1 - a0) * (b1 - b0), ux, uz, a0, a1, b0, b1 };
+    if (!best || box.area < best.area) best = box;
+    if (sides > perim / 2 && (!bestSides || box.area < bestSides.area)) bestSides = box;
   }
-  const { ux, uz, a0, a1, b0, b1 } = best;
+  const { ux, uz, a0, a1, b0, b1 } = bestSides || best;
   const ca = (a0 + a1) / 2, cb = (b0 + b1) / 2;
   let len = a1 - a0, wid = b1 - b0, ang = Math.atan2(uz, ux);
   if (wid > len) { [len, wid] = [wid, len]; ang += Math.PI / 2; }
   return { cx: ca * ux - cb * uz, cz: ca * uz + cb * ux, len, wid, ang };
+}
+function deckBox(ring, ob, root) {
+  // The pier builder (city-grid.js) lays one deck along the box, from its root end (root: +1 if that is the end along
+  // its heading, -1 if the other) out to the far end: the box is narrowed to the pier's body, the outline's median
+  // cross-section over its seaward two thirds, and moved across onto it. The whole outline's box takes in the root as
+  // well, spreading the deck over the water beside the body: Pier 26 is 133 m wide at the bulkhead about a 37 m body,
+  // Pier 62's root runs off along the shore at 21° (97 m across its box, about a 45 m body), and the headhouses at the
+  // roots of Chelsea Piers 59-61 reach across the slips between them. A body too narrow for a deck (Pier 66's 6 m
+  // walkway) keeps the whole box.
+  const MIN_WID = 12; // m
+  const ax = Math.cos(ob.ang), az = Math.sin(ob.ang);
+  // the vertices along (t) and across (s) the box, from its centre
+  const t = ring.map(([x, z]) => (x - ob.cx) * ax + (z - ob.cz) * az);
+  const s = ring.map(([x, z]) => (z - ob.cz) * ax - (x - ob.cx) * az);
+  const lo = [], hi = [];
+  for (let u = ob.len / 3 + 0.5; u < ob.len; u++) {
+    const tu = root * (ob.len / 2 - u); // u metres out from the root end
+    let s0 = Infinity, s1 = -Infinity;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      if ((t[i] > tu) === (t[j] > tu)) continue;
+      const sc = s[j] + ((tu - t[j]) * (s[i] - s[j])) / (t[i] - t[j]);
+      s0 = Math.min(s0, sc); s1 = Math.max(s1, sc);
+    }
+    if (s1 > s0) { lo.push(s0); hi.push(s1); }
+  }
+  if (!lo.length) return ob;
+  const median = (a) => a.sort((p, q) => p - q)[a.length >> 1];
+  const b0 = median(lo), b1 = median(hi), m = (b0 + b1) / 2;
+  return b1 - b0 < MIN_WID ? ob : { cx: ob.cx - az * m, cz: ob.cz + ax * m, len: ob.len, wid: b1 - b0, ang: ob.ang };
 }
 const mnRing = geo.manhattan;
 function distToRing(x, z, ring) {
@@ -152,7 +185,7 @@ for (const p of geo.pierPolys) {
   if (Math.min(dA, dB) > 25) continue;
   const ring = rdpRing(p.ring, 0.6);
   if (ringArea(ring) > 0) ring.reverse();
-  piers.push({ name: p.name, ...ob, area: Math.round(area), ring });
+  piers.push({ name: p.name, ...deckBox(p.ring, ob, dA < dB ? 1 : -1), area: Math.round(area), ring });
 }
 // merge duplicate outlines of the same named pier (keep the largest)
 piers.sort((a, b) => b.area - a.area);

@@ -61,8 +61,31 @@ async function initApp() {
     initMark = now;
   };
 
-  await renderer.init();
+  try {
+    await renderer.init();
+  } catch (error) {
+    // three.js falls back to WebGL 2 where WebGPU is unavailable: without a WebGL 2 context either (an old browser, a
+    // blocklisted GPU, hardware acceleration turned off) there is nothing to draw the city with
+    if (document.createElement('canvas').getContext('webgl2')) throw error;
+    showStartupError(error, 'This browser can’t run Slop New York',
+      'It needs WebGPU or WebGL 2: try an up-to-date browser, with hardware acceleration turned on.');
+    return;
+  }
   markInit('renderer');
+  // A GPU lost before the city is on screen (a driver reset, the GPU out of memory) ends the start-up on the loading
+  // screen as well: three.js only logs it (kept below) and stops drawing, which would leave a blank canvas behind it
+  let starting = true; // until the city is on screen and the loading screen gone
+  const onDeviceLost = renderer.onDeviceLost;
+  renderer.onDeviceLost = (info) => {
+    if (onDeviceLost) onDeviceLost.call(renderer, info);
+    if (!starting) return;
+    starting = false;
+    renderer.setAnimationLoop(null);
+    showStartupError(new Error(`${info?.api ?? 'GPU'} device lost: ${info?.message ?? 'unknown reason'}`));
+  };
+  // The HUD names the backend actually drawing the city: WebGPU, or the WebGL 2 fallback
+  const elBackend = document.getElementById('hud-backend');
+  if (elBackend) elBackend.textContent = renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2';
 
   // 2. Build Scene & Physical Atmospheric Sky / PMREM IBL / 4096x4096 Shadow Lighting
   const scene = new THREE.Scene();
@@ -280,7 +303,9 @@ async function initApp() {
     touchControls.setMode(controllerManager.activeMode);
     gamepadControls.reset();
     modeButtons.forEach((btn) => {
-      btn.classList.toggle('active', btn.getAttribute('data-mode') === mode);
+      const active = btn.getAttribute('data-mode') === mode;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
     });
     document.body.dataset.mode = mode;
     placeModeIndicator();
@@ -298,7 +323,9 @@ async function initApp() {
   function selectCamera(camId, snap = false) {
     cameraSystem.setCameraPreset(camId, snap);
     cameraButtons.forEach((btn) => {
-      btn.classList.toggle('active', btn.getAttribute('data-camera') === camId);
+      const active = btn.getAttribute('data-camera') === camId;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
     });
     const preset = cameraSystem.getActivePreset();
     if (elCamera) elCamera.textContent = preset.name;
@@ -315,7 +342,9 @@ async function initApp() {
     lightingSystem.applyPreset(timeId);
     colorGrade.applyPreset(lightingSystem.activePresetId);
     timeButtons.forEach((btn) => {
-      btn.classList.toggle('active', btn.getAttribute('data-time') === timeId);
+      const active = btn.getAttribute('data-time') === timeId;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
     });
   }
 
@@ -452,7 +481,9 @@ async function initApp() {
     trafficSystem,
     allBlocks: cityBlocks.allBlocks,
     onToggle: (open) => {
+      // The open map takes the input: the arrow keys, WASD, Space & Shift mustn't drive the player hidden behind it
       controllerManager.resetInput();
+      controllerManager.setKeyboardEnabled(!open);
       touchControls.setEnabled(!open);
       gamepadControls.setEnabled(!open);
       const mapHint = document.getElementById('fullmap-hover-info');
@@ -488,9 +519,10 @@ async function initApp() {
     });
   }
 
-  // Global keyboard shortcuts for modes (1-4), cameras (V / 5-0), and HUD (H)
+  // Global keyboard shortcuts for modes (1-4), cameras (V / 5-0), HUD (H), sound (N) and horn (B): once per press, not
+  // on key repeat, and never on browser or system shortcuts (Cmd+V, Ctrl+1, Alt+1 switching tabs...)
   window.addEventListener('keydown', (e) => {
-    if (isTypingInField(e)) return;
+    if (e.repeat || e.metaKey || e.ctrlKey || e.altKey || isTypingInField(e)) return;
     switch (e.code) {
       case 'Digit1':
         selectMode('person');
@@ -529,10 +561,10 @@ async function initApp() {
         if (hudToggleBtn) hudToggleBtn.click();
         break;
       case 'KeyN':
-        if (!e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) audioSystem.setEnabled(!audioSystem.enabled);
+        audioSystem.setEnabled(!audioSystem.enabled);
         break;
       case 'KeyB':
-        if (!e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey && !mapSystem.isFullMapOpen) audioSystem.honk(controllerManager.getActiveEntity());
+        if (!mapSystem.isFullMapOpen) audioSystem.honk(controllerManager.getActiveEntity());
         break;
     }
   });
@@ -652,7 +684,7 @@ async function initApp() {
 
   if (elFps) elFps.textContent = '60';
 
-  renderer.setAnimationLoop((now) => {
+  const animate = (now) => {
     const rawDt = (now - lastTime) * 0.001;
     lastTime = now;
     const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
@@ -713,6 +745,8 @@ async function initApp() {
       // compiled), i.e. until the city is actually on screen
       const device = renderer.backend.device;
       Promise.resolve(device && device.queue.onSubmittedWorkDone()).catch(() => {}).then(() => {
+        if (!starting) return; // a frame failed meanwhile: its error stays on the loading screen (see the loop)
+        starting = false;
         markInit('gpu');
         console.log(`[init] ${initTimings.join(', ')}`);
         initTimings = null;
@@ -748,7 +782,48 @@ async function initApp() {
       const where = cameraSystem.getActivePreset().category === 'follow' ? activeEnt.position : cameraSystem.currentPos;
       renderLocation(getLocationLabel(where.x, where.z));
     }
+  };
+
+  if (!starting) return; // the GPU was lost while the city was being set up: its error is on the loading screen
+  // Until the city is on screen, a frame that throws (a pipeline the warm-up couldn't build, an incompatible three.js
+  // dev build...) ends the start-up on the loading screen, rather than throwing again every frame behind it
+  renderer.setAnimationLoop((now) => {
+    if (!starting) {
+      animate(now);
+      return;
+    }
+    try {
+      animate(now);
+    } catch (error) {
+      starting = false;
+      renderer.setAnimationLoop(null);
+      showStartupError(error);
+    }
   });
 }
 
-initApp();
+// A failed start-up (no WebGPU or WebGL 2, an incompatible three.js dev build, a shader that won't build...) ends on
+// the loading screen in plain words, instead of leaving its progress up forever: what went wrong, if known (title &
+// detail), else the error's message for bug reports. The console gets the whole error.
+function showStartupError(error, title = 'Slop New York couldn’t start. Reload the page to try again.', detail = null) {
+  console.error('[init]', error);
+  const overlay = document.getElementById('loading-overlay');
+  const status = document.getElementById('loading-status');
+  if (!overlay || !status) return;
+  overlay.classList.add('is-error');
+  const track = overlay.querySelector('.loader-track');
+  if (track) track.classList.remove('is-indeterminate');
+  status.textContent = title;
+  if (detail === null) {
+    // The first line, at most 200 characters (shader compiler logs run to pages)
+    const text = error && error.message ? `${error.name || 'Error'}: ${error.message}` : String(error);
+    const line = text.split('\n')[0];
+    detail = line.length > 200 ? `${line.slice(0, 199)}…` : line;
+  }
+  const note = document.createElement('p');
+  note.className = 'loader-detail';
+  note.textContent = detail;
+  status.after(note);
+}
+
+initApp().catch(showStartupError);

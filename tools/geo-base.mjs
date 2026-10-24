@@ -68,7 +68,9 @@ function bbox(pts) {
   }
   return { x0, x1, z0, z1 };
 }
-// Ramer-Douglas-Peucker on an open polyline
+// Ramer-Douglas-Peucker on an open polyline. A run whose ends meet (a loop road chained back to its start) has no
+// chord to measure from: its points are measured from that end instead, so the loop keeps its farthest point and both
+// halves simplify as usual
 function rdp(pts, eps) {
   if (pts.length < 3) return pts.slice();
   const keep = new Uint8Array(pts.length);
@@ -79,10 +81,11 @@ function rdp(pts, eps) {
     const [ax, az] = pts[a];
     const [bx, bz] = pts[b];
     const dx = bx - ax, dz = bz - az;
-    const L = Math.hypot(dx, dz) || 1e-9;
+    const L = Math.hypot(dx, dz);
     let best = -1, bi = -1;
     for (let i = a + 1; i < b; i++) {
-      const d = Math.abs((pts[i][0] - ax) * dz - (pts[i][1] - az) * dx) / L;
+      const px = pts[i][0] - ax, pz = pts[i][1] - az;
+      const d = L > 1e-6 ? Math.abs(px * dz - pz * dx) / L : Math.hypot(px, pz);
       if (d > best) { best = d; bi = i; }
     }
     if (best > eps) {
@@ -112,6 +115,26 @@ function pointInRing(x, z, r) {
     if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) inside = !inside;
   }
   return inside;
+}
+// Closed rings from the outline pieces of an OSM multipolygon (a relation often splits an outer ring across several
+// open ways): each ring takes on the piece that starts or ends at its loose end, turned round if need be, until it
+// closes. A ring that can't close (a piece missing from the data) is returned open.
+function chainRings(parts) {
+  const rest = parts.slice();
+  const rings = [];
+  const near = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.5;
+  while (rest.length) {
+    let ring = rest.shift();
+    for (let guard = 0; guard < 500 && !near(ring[0], ring[ring.length - 1]); guard++) {
+      const end = ring[ring.length - 1];
+      const i = rest.findIndex((p) => near(p[0], end) || near(p[p.length - 1], end));
+      if (i < 0) break;
+      const p = rest.splice(i, 1)[0];
+      ring = ring.concat(near(p[0], end) ? p.slice(1) : p.slice(0, -1).reverse());
+    }
+    rings.push(ring);
+  }
+  return rings;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -341,20 +364,25 @@ for (const f of dcp.features) {
 }
 const centroid = (r) => [r.reduce((t, p) => t + p[0], 0) / r.length, r.reduce((t, p) => t + p[1], 0) / r.length];
 
-// OSM piers (closed ways & multipolygons) in world coordinates, with names
+// OSM piers (closed ways & multipolygons) in world coordinates, with names. Most multipolygon piers split their outline
+// across several open ways (Pier 26 across seven): they're chained back into whole rings, or each piece would stand in
+// for the pier, closed by a straight chord.
 const osmPiers = load('osm_piers.json');
 const pierPolys = [];
+let openPierRings = 0;
 for (const e of osmPiers.elements) {
   const t = e.tags || {};
   if (e.type === 'way' && e.geometry && e.nodes && e.nodes[0] === e.nodes[e.nodes.length - 1]) {
     pierPolys.push({ name: t.name || '', ring: e.geometry.map((g) => toWorld(g.lon, g.lat)) });
   } else if (e.type === 'relation') {
-    for (const m of e.members || []) {
-      if (m.role === 'outer' && m.geometry) pierPolys.push({ name: t.name || '', ring: m.geometry.map((g) => toWorld(g.lon, g.lat)) });
+    const parts = (e.members || []).filter((m) => m.role === 'outer' && m.geometry).map((m) => m.geometry.map((g) => toWorld(g.lon, g.lat)));
+    for (const ring of chainRings(parts)) {
+      if (Math.hypot(ring[0][0] - ring[ring.length - 1][0], ring[0][1] - ring[ring.length - 1][1]) >= 0.5) openPierRings++;
+      pierPolys.push({ name: t.name || '', ring });
     }
   }
 }
-log(`${pierPolys.length} OSM pier polygons`);
+log(`${pierPolys.length} OSM pier polygons${openPierRings ? ` (${openPierRings} multipolygon outlines left open: pieces missing)` : ''}`);
 
 // --- Manhattan island: DCP polygon, minus the piers, opened to drop slivers, as a bulkhead line ---------------------
 const RES = 2;
@@ -363,11 +391,24 @@ const mbb = bbox(mnRing);
 const ras = new Raster(mbb.x0 - 60, mbb.z0 - 60, mbb.x1 + 60, mbb.z1 + 60, RES);
 ras.fillRing(mnRing, 1);
 const pierCells = new Raster(mbb.x0 - 60, mbb.z0 - 60, mbb.x1 + 60, mbb.z1 + 60, RES);
-// Piers off the island: OSM pier polygons whose area lies mostly beyond a slightly eroded shore get cut out
+// Piers off the island get cut out, each closed over the water between its own arms (gaps under 60 m): DCP's shore
+// still draws Pier 34's two walkways out to the Holland Tunnel vent as one solid deck, and cutting the walkways alone
+// would leave the water between them as a 240 m spit of land
+const ARM_GAP = 30; // closing radius, m
 for (const p of pierPolys) {
   const [cx, cz] = centroid(p.ring);
   if (cz < mbb.z0 - 200 || cz > mbb.z1 + 200 || cx < mbb.x0 - 600 || cx > mbb.x1 + 600) continue;
-  pierCells.fillRing(p.ring, 1);
+  const pb = bbox(p.ring), m = ARM_GAP + 4;
+  const one = new Raster(pb.x0 - m, pb.z0 - m, pb.x1 + m, pb.z1 + m, RES);
+  one.fillRing(p.ring, 1);
+  one.close(ARM_GAP);
+  const di = Math.round((one.x0 - pierCells.x0) / RES), dj = Math.round((one.z0 - pierCells.z0) / RES);
+  for (let j = 0; j < one.h; j++) {
+    for (let i = 0; i < one.w; i++) {
+      const gi = i + di, gj = j + dj;
+      if (one.d[j * one.w + i] && gi >= 0 && gj >= 0 && gi < pierCells.w && gj < pierCells.h) pierCells.d[gj * pierCells.w + gi] = 1;
+    }
+  }
 }
 {
   // Grow the pier mask by 4 m: OSM pier outlines and DCP's pier decks differ by a few metres
@@ -482,4 +523,4 @@ coastChains.sort((a, b) => b.length - a.length);
 log(`OSM coastline: ${coastChains.length} chains; longest ${coastChains.slice(0, 6).map((c) => c.length).join(', ')}`);
 
 const geo = { THETA, ORIGIN, manhattan, islands, boroughs, coastChains, pierPolys, mnRing, shoreProfile };
-export { geo, toWorld, gridUV, rdp, rdpRing, ringArea, bbox, pointInRing, Raster, r1, load, log, segLines, cscl, centroid };
+export { geo, toWorld, gridUV, rdp, rdpRing, ringArea, bbox, pointInRing, chainRings, Raster, r1, load, log, segLines, cscl, centroid };

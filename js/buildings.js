@@ -1437,44 +1437,61 @@ function buildCityBlocks(scene) {
     }
   }
 
-  // East River lots between 1st Ave and the FDR Drive (23rd–58th St), too narrow for regular lots: a 2-4 storey podium
-  // with a slab rising from it, as tall as the lot is wide allows (Kips Bay & NYU Langone hospital slabs, glass towers
-  // on the old Con Ed site at 35th–41st St, Beekman & Sutton Place apartment towers). On the 42nd–45th St superblock
-  // stands the United Nations Secretariat (1952): a blue-green curtain-wall slab between marble end walls, with the
-  // low General Assembly hall and the North Lawn Building on the lots north of it.
+  // East River lots between 1st Ave and the FDR Drive (city-config.js districtAt 'riverfront': 23rd–49th St, where the
+  // side streets stop short of the river), by their real place: Kips Bay's hospital row south of 34th St (Bellevue,
+  // NYU Langone, the VA), apartment towers on the old Con Ed sites up to 41st St (Rivergate, the American Copper
+  // Buildings, 685 First Ave) and the United Nations headquarters on its superblock (unHeadquarters). The same curb
+  // island's lots north of 48th St (around River House at 52nd St) are built like Turtle Bay's.
   function riverfrontBlock(blk, cfg, x0, x1) {
-    const { minZ, maxZ, cz } = blk;
-    const lot = rect(x0, x1, minZ, maxZ);
-    if (cz > -85 && cz < -10 && maxZ - minZ > 45) {
-      const f = 36;
-      const glass = building(blk, 3, lot);
-      mass(glass, [rect(x0, x1, minZ + 2.4, maxZ - 2.4)], 0, f);
-      commit(blk, glass, { cornice: false, roof: 'none' });
-      const top = Math.round((f * storeys[3]) / storeys[0]);
-      for (const [z0, z1] of [[minZ + 1, minZ + 2.4], [maxZ - 2.4, maxZ - 1]]) {
-        const end = building(blk, 0, rect(x0 - 0.3, x1 + 0.3, z0, z1));
-        mass(end, [rect(x0 - 0.3, x1 + 0.3, z0, z1)], 0, top);
-        commit(blk, end, { cornice: false, roof: 'none', walls: WALL_KINDS.blankStone }); // windowless marble
+    const [, z] = toWorld(blk.cx, blk.cz);
+    if (z > streetZ(34)) officeBlock(blk, RIVER_HOSPITALS, x0, x1);
+    else if (z > streetZ(42)) officeBlock(blk, RIVER_TOWERS, x0, x1);
+    else if (z > streetZ(48)) unHeadquarters(blk, x0, x1);
+    else residentialBlock(blk, RES_EAST_MIDTOWN, x0, x1);
+  }
+
+  // The United Nations headquarters (1952) between 42nd and 48th St, laid out around the Secretariat's real footprint:
+  // the 39-storey slab (154 m), its blue-green curtain walls facing the city and the river between windowless marble
+  // end walls to the north and south; north of it the low General Assembly Building under its dome, the Conference
+  // Building along the river joining the two, the Dag Hammarskjöld Library at 42nd St & 1st Ave and the North Lawn's
+  // gardens up to 48th St. Each building stands where it really does, if the lot holds it whole.
+  const UN_SECRETARIAT = LANDMARK_SITES['United Nations Secretariat Building'] ||
+    { x: avenueX('1') + 123, z: streetZ(43) + 4, w: 21.7, d: 90.2 };
+  const holdsSecretariat = (x0, x1, z0, z1) => x0 < UN_SECRETARIAT.x && x1 > UN_SECRETARIAT.x &&
+    z0 < UN_SECRETARIAT.z && z1 > UN_SECRETARIAT.z;
+  function unHeadquarters(blk, x0, x1) {
+    const { minZ, maxZ } = blk;
+    const fits = (r) => r.x0 >= x0 - EPS && r.x1 <= x1 + EPS && r.z0 >= minZ - EPS && r.z1 <= maxZ + EPS;
+    // A freestanding building of facade `mat`, `f` storeys on footprint r (and `crown` more on a square in its middle)
+    const place = (mat, r, f, o = {}, crown = 0) => {
+      if (!fits(r)) return;
+      const b = building(blk, mat, r);
+      mass(b, [r], 0, f);
+      if (crown) {
+        const c = Math.min(rectW(r), rectD(r)) * 0.225;
+        const mx = (r.x0 + r.x1) * 0.5, mz = (r.z0 + r.z1) * 0.5;
+        mass(b, [rect(mx - c, mx + c, mz - c, mz + c)], f, f + crown);
       }
-      return;
+      commit(blk, b, { cornice: false, roof: 'none', awnings: false, shops: 'none', freestanding: true, ...o });
+    };
+    const S = UN_SECRETARIAT;
+    const sx0 = S.x - S.w / 2, sx1 = S.x + S.w / 2, sz0 = S.z - S.d / 2, sz1 = S.z + S.d / 2;
+    const END = 1.4; // marble end walls' depth, standing 0.3 m proud of the glass
+    const f = Math.round(154 / storeys[3]);
+    place(3, rect(sx0, sx1, sz0 + END, sz1 - END), f);
+    const top = Math.round((f * storeys[3]) / storeys[0]);
+    for (const [z0, z1] of [[sz0, sz0 + END], [sz1 - END, sz1]]) {
+      place(0, rect(sx0 - 0.3, sx1 + 0.3, z0, z1), top, { walls: WALL_KINDS.blankStone });
     }
-    if (cz > -180 && cz < -90) {
-      const hall = building(blk, 0, lot);
-      mass(hall, [lot], 0, cz > -130 ? 7 : 4);
-      commit(blk, hall, { cornice: false, roof: 'mech', hvacH: 2.6 });
-      return;
-    }
-    const mat = cz > 180
-      ? pickW([[0, 3], [3, 2], [1, 1]])
-      : cz > 0 ? pickW([[5, 2], [3, 2], [4, 1], [1, 1]]) : pickW([[0, 4], [1, 2], [3, 1]]);
-    const b = building(blk, mat, lot);
-    const pf = irange(2, 4);
-    mass(b, [lot], 0, pf);
-    const sx = Math.max(0, Math.min(1.8, (x1 - x0 - 9) * 0.5));
-    const slab = rect(x0 + sx, x1 - sx, minZ + range(1, 3), maxZ - range(1, 3));
-    const f = cz > 180 ? irange(12, 24) : cz > 0 ? irange(26, 42) : irange(18, 34);
-    mass(b, [slab], pf, Math.max(pf + 6, Math.min(f, Math.floor(((x1 - x0) * 8) / storeys[mat]))));
-    commit(blk, b, mat <= 2 ? { roof: 'prewar', wtP: 0.35, corniceH: 0.6 } : { cornice: false, roof: 'mech' });
+    // The Conference Building (4 storeys) along the river from the Secretariat's middle to 45th St, the General Assembly
+    // Building (marble, ~26 m and its dome) west of its north end, the library on the corner of 42nd St & 1st Ave
+    const east = sx1 + 0.3;
+    place(3, rect(east, Math.min(x1 - 1, east + 30), streetZ(45), S.z), 4);
+    place(0, rect(east - 50, east, streetZ(46) + 24, streetZ(44) - 12), 7, { walls: WALL_KINDS.blankStone }, 2);
+    place(0, rect(x0 + 6, x0 + 58, maxZ - 30, maxZ - 6), 3);
+    // The North Lawn's gardens from 48th St down to the General Assembly
+    const lawn = rect(x0 + 3, x1 - 3, minZ + 3, streetZ(46) + 16);
+    if (rectD(lawn) > 10) blk.yards.push(lawn);
   }
 
   // Sheer avenue wall carrying a Broadway billboard (flush ≥ 46m), often a tower rising behind it
@@ -1732,6 +1749,27 @@ function buildCityBlocks(scene) {
     fillFloors: [8, 16]
   };
 
+  // The East River lots (riverfrontBlock): Kips Bay's hospital row, slabs & towers in brick, limestone & glass on podiums
+  // with mid-rise wings, and the old Con Ed sites' glass apartment towers (~110-165 m) over low podiums & plazas
+  const RIVER_HOSPITALS = {
+    ...OFFICE_MIDTOWN,
+    plans: [['major', 4], ['pair', 3], ['full', 1]],
+    styles: [['slab', 3], ['glass', 2]],
+    towerFloors: [15, 26],
+    glassMats: [[1, 3], [0, 2], [3, 3]],
+    fillMats: [[1, 4], [0, 3], [3, 2]],
+    fillFloors: [5, 12]
+  };
+  const RIVER_TOWERS = {
+    ...OFFICE_MIDTOWN,
+    plans: [['major', 4], ['pair', 2], ['full', 1]],
+    styles: [['glass', 1]],
+    towerFloors: [28, 40],
+    glassMats: [[5, 3], [3, 2], [4, 2]],
+    fillMats: [[3, 2], [1, 1], [0, 1]],
+    fillFloors: [3, 8]
+  };
+
   const PROJECTS = { kind: 'projects', floors: [12, 20], mats: [[1, 8], [0, 2]] };
   const PROJECTS_STUY_TOWN = { ...PROJECTS, floors: [12, 14], mats: [[1, 1]] };
   const LOWRISE = { kind: 'lowrise', floors: [2, 7] };
@@ -1769,7 +1807,8 @@ function buildCityBlocks(scene) {
       case 'hudson_yards': return OFFICE_HUDSON_YARDS;
       case 'billionaires_row': return chance(0.6) ? OFFICE_BILLIONAIRES : OFFICE_MIDTOWN;
       case 'midtown': return OFFICE_MIDTOWN;
-      case 'garment': return blk.cz > streetZ(36) ? LOFT_GARMENT_SOUTH : LOFT_GARMENT;
+      // (the lofts run lower south of 36th St and between 5th & 6th Aves, where the Empire State rises over them)
+      case 'garment': return blk.cz > streetZ(36) || blk.cx > avenueX('6') ? LOFT_GARMENT_SOUTH : LOFT_GARMENT;
       case 'murray_hill': return RES_MURRAY_HILL;
       case 'turtle_bay': return RES_EAST_MIDTOWN;
       case 'hells_kitchen': return RES_HELLS_KITCHEN;
@@ -1808,7 +1847,7 @@ function buildCityBlocks(scene) {
   function populateBlock(minX, maxX, minZ, maxZ, colIndex, rowIndex, isOuter = false, lowRiseEsplanade = false, district = 'midtown') {
     const bw = maxX - minX;
     const bd = maxZ - minZ;
-    if (bw < (district === 'riverfront' ? 9 : minLot) || bd < minLot) return;
+    if (bw < minLot || bd < minLot) return;
     const cx = (minX + maxX) * 0.5;
     const cz = (minZ + maxZ) * 0.5;
 
@@ -1975,7 +2014,8 @@ function buildCityBlocks(scene) {
   //    out along each street they front, filled in the frame and turned into place.
   // ============================================================================
   // Superblocks (Battery Park City, the campuses & housing projects uptown, Stuy Town...) are cut into strips about a
-  // street block deep with a ~9 m passage between them, so no lot (and no building) runs 100+ m deep
+  // street block deep with a ~9 m passage between them, so no lot (and no building) runs 100+ m deep. The United
+  // Nations' superblock stays whole: unHeadquarters lays it out around the Secretariat
   const DEEP_LOT = 95;
   function splitDeep(r) {
     const [x0, x1, z0, z1] = r;
@@ -1995,7 +2035,8 @@ function buildCityBlocks(scene) {
       xf = th ? { th, cs: Math.cos(th), sn: Math.sin(th), px, pz } : null;
       for (const r of rects) {
         for (const part of minusReserves(r)) {
-          for (const [x0, x1, z0, z1] of splitDeep(part)) {
+          const un = b.district === 'riverfront' && !xf && holdsSecretariat(...part);
+          for (const [x0, x1, z0, z1] of un ? [part] : splitDeep(part)) {
             if (x1 - x0 < minLot || z1 - z0 < minLot) continue;
             populateBlock(x0, x1, z0, z1, 0, 0, false, false, b.district);
           }

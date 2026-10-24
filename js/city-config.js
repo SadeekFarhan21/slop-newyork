@@ -212,7 +212,9 @@ function getBroadwayX(z) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Waterfront piers: the real piers (position, length, width, heading) with what the pier builder puts on them
+// Waterfront piers: the real piers with what the pier builder puts on them. Each has the box of its deck along the
+// pier's body (centre, length, width, heading) and its whole outline (`ring`), roots wider than the body included
+// (city-grid.js decks those beside the body)
 // ---------------------------------------------------------------------------------------------------------------------
 const PIER_KINDS = [
   // [OSM name, display name, kind, extras]
@@ -550,11 +552,15 @@ function districtAt(x, z) {
   }
   if (z < Z(96) && x > XA('5') + 10) return 'east_harlem';
   if (z < Z(59)) return x < cp.minX ? 'uws' : 'ues';
+  // The East River waterfront east of 1st Ave from 23rd to 49th St, where the side streets stop short of the FDR Drive:
+  // Kips Bay's hospital row, the towers on the old Con Ed sites and the United Nations headquarters (Peter Cooper Village
+  // & Stuyvesant Town south of it and the street grid of Beekman & Sutton Places north of it stay residential)
+  if (x > XA('1') + 20 && z > Z(49) && z < Z(23)) return 'riverfront';
   if (z < Z(34)) {
     if (x < XA('8') - 20) return z > Z(42) && x < XA('10') - 20 ? 'hudson_yards' : 'hells_kitchen';
     if (x > XA('3') + 20) return 'turtle_bay';
     if (z < Z(56) && x < XA('lex')) return 'billionaires_row';
-    if (z > Z(42) && x < XA('6')) return 'garment';
+    if (z > Z(42) && x < XA('5')) return 'garment'; // 34th to 42nd St, from 5th Ave west
     if (z > Z(38) && x > XA('madison')) return 'murray_hill';
     return 'midtown';
   }

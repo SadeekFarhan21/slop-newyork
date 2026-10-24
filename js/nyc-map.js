@@ -549,10 +549,11 @@ class NYCMapSystem {
       this.elSearchInput.addEventListener('input', () => this.search(this.elSearchInput.value));
     }
 
+    // M toggles once per press: not on key repeat, nor on browser / system shortcuts (Cmd+M minimizes the window)
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Escape' && this.isFullMapOpen) {
         this.toggleFullMap(false);
-      } else if (e.code === 'KeyM' && !isTypingInField(e)) {
+      } else if (e.code === 'KeyM' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey && !isTypingInField(e)) {
         this.toggleFullMap(!this.isFullMapOpen);
       }
     });
@@ -697,7 +698,12 @@ class NYCMapSystem {
 
   toggleFullMap(open) {
     this.isFullMapOpen = Boolean(open);
-    if (!this.isFullMapOpen) this.cancelPan();
+    if (!this.isFullMapOpen) {
+      this.cancelPan();
+      // The keyboard goes back to the player: a search box left focused behind the closed map would swallow WASD
+      const focused = document.activeElement;
+      if (focused && this.modal && this.modal.contains(focused)) focused.blur();
+    }
     if (this.onToggle) this.onToggle(this.isFullMapOpen);
     if (!this.modal) return;
     this.modal.classList.toggle('hidden', !this.isFullMapOpen);
