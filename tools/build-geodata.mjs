@@ -2,7 +2,7 @@
 // usage: GEO_DATA=tools/data node --max-old-space-size=8192 tools/build-geodata.mjs [out.js]
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { geo, toWorld, rdp, rdpRing, ringArea, bbox, load, log, centroid } from './geo-base.mjs';
+import { geo, toWorld, rdp, rdpRing, ringArea, bbox, chainRings, load, log, centroid } from './geo-base.mjs';
 import { pieces, STREETS, AVENUES } from './geo-streets.mjs';
 import { blocks, innerRing, roads, PLAZAS, CUT_Z, STRIP, SIDEWALK } from './geo-blocks.mjs';
 import { parkShapes, piers, bridges, nj, islands, manhattanSouth, manhattanNorth } from './geo-extra.mjs';
@@ -91,30 +91,13 @@ cp.outline = flat(rdpRing(cpPark.rings.reduce((a, r) => (Math.abs(ringArea(r)) >
 const WATER_NAMES = new Set(['Jacqueline Kennedy Onassis Reservoir', 'The Lake', 'The Pond', 'Harlem Meer', 'Turtle Pond', 'Conservatory Water', 'The Pool']);
 const LAWN_NAMES = new Set(['Sheep Meadow', 'The Great Lawn', 'North Meadow', 'Great Hill', 'Heckscher Ballfields', 'East Meadow', 'Cedar Hill', 'Pilgrim Hill', 'The Dene', 'Conservatory Garden', 'Strawberry Fields']);
 const SITE_NAMES = ['Bethesda Fountain', 'Bow Bridge', 'Belvedere Castle', 'Gapstow Bridge', "Cleopatra's Needle", 'Central Park Carousel', 'The Dairy (Visitor Center and Gift Shop)', 'Delacorte Theater', 'Kerbs Boathouse', 'The Arsenal', 'Central Park Zoo', 'Columbus Circle', 'Pulitzer Fountain', 'Charles A. Dana Discovery Center', 'Loeb Boathouse', 'Wollman Rink', 'Bethesda Terrace'];
-function elemRing(e) {
-  if (e.type === 'way') return (e.geometry || []).map((g) => toWorld(g.lon, g.lat));
-  let best = [];
-  for (const m of e.members || []) if (m.role === 'outer' && m.geometry && m.geometry.length > best.length) best = m.geometry.map((g) => toWorld(g.lon, g.lat));
-  return best;
-}
 function elemRings(e) {
   // relations (The Lake, Turtle Pond, Harlem Meer) come as several outer ways: chain them into closed rings
   if (e.type === 'way') return [(e.geometry || []).map((g) => toWorld(g.lon, g.lat))];
-  const parts = (e.members || []).filter((m) => m.role === 'outer' && m.geometry).map((m) => m.geometry.map((g) => toWorld(g.lon, g.lat)));
-  const rings = [];
-  const close = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.5;
-  while (parts.length) {
-    let ring = parts.shift();
-    for (let guard = 0; guard < 500 && !close(ring[0], ring[ring.length - 1]); guard++) {
-      const i = parts.findIndex((p) => close(p[0], ring[ring.length - 1]) || close(p[p.length - 1], ring[ring.length - 1]));
-      if (i < 0) break;
-      const p = parts.splice(i, 1)[0];
-      ring = ring.concat(close(p[0], ring[ring.length - 1]) ? p.slice(1) : p.reverse().slice(1));
-    }
-    rings.push(ring);
-  }
-  return rings;
+  return chainRings((e.members || []).filter((m) => m.role === 'outer' && m.geometry).map((m) => m.geometry.map((g) => toWorld(g.lon, g.lat))));
 }
+// A feature's outline: the way, or a relation's longest outer ring
+const elemRing = (e) => elemRings(e).reduce((best, r) => (r.length > best.length ? r : best), []);
 const seenSites = new Set();
 for (const e of osmCP.elements) {
   const t = e.tags || {};
@@ -216,6 +199,8 @@ const GEO = {
     b.frames ? b.frames.map(([th, px, pz, rs]) => [Math.round(th * 1e4) / 1e4, q(px), q(pz), rs.map((r) => r.map(q))]) : 0]),
   parks: parkShapes.map((p) => ({ name: p.name, cat: p.cat, acres: p.acres, rings: p.rings.map(flat) })),
   centralPark: cp,
+  // Piers off Manhattan's shore (OSM): the deck, a box along the pier's body (centre, length, width, heading; see
+  // deckBox in geo-extra.mjs), and the whole outline
   piers: piers.map((p) => ({ name: p.name, cx: q(p.cx), cz: q(p.cz), len: q(p.len), wid: q(p.wid), ang: Math.round(p.ang * 1e4) / 1e4, ring: flat(p.ring) })),
   bridges: Object.fromEntries(Object.entries(bridges).map(([k, b]) => [k, { a: b.a.map(q), mid: b.mid.map(q), dir: [Math.round(b.ux * 1e5) / 1e5, Math.round(b.uz * 1e5) / 1e5] }])),
   landmarks,

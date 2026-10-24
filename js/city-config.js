@@ -212,7 +212,9 @@ function getBroadwayX(z) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Waterfront piers: the real piers (position, length, width, heading) with what the pier builder puts on them
+// Waterfront piers: the real piers with what the pier builder puts on them. Each has the box of its deck along the
+// pier's body (centre, length, width, heading) and its whole outline (`ring`), roots wider than the body included
+// (city-grid.js decks those beside the body)
 // ---------------------------------------------------------------------------------------------------------------------
 const PIER_KINDS = [
   // [OSM name, display name, kind, extras]
