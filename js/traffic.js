@@ -13,6 +13,8 @@ import {
   createLoftedCarMaterial,
   buildLightbarGeometry,
   createLightbarMaterial,
+  LIGHTBAR_RATE,
+  lightbarFlash,
   buildLoftedBusBodyGeometry,
   buildBusSignGeometry,
   buildBusWheelGeo,
@@ -26,7 +28,8 @@ import { PersonCrowd, PersonRig } from './pedestrians.js';
 // - 200 cars (taxis, sedans, SUVs, NYPD cruisers) and 12 MTA buses keep to their lanes and follow the vehicle
 //   ahead (Intelligent Driver Model), change lanes to overtake or to reach a turn lane, turn into other streets,
 //   stop for the signals street-details.js shows, give way to oncoming traffic when turning left, to the avenue at
-//   unsignalized corners and to pedestrians on crosswalks, and never enter an intersection they can't clear.
+//   unsignalized corners (until a driver kept waiting there gets its turn) and to pedestrians on crosswalks, and never
+//   enter an intersection they can't clear.
 // - 340 pedestrians follow connected sidewalks, meet to talk, and cross signalized crosswalks on WALK.
 // - Fixed-size local populations replenish distant roads and sidewalks in every direction, protecting the near view.
 // - The player's vehicle or character pushes and is pushed by the traffic (SAT contact, impulses, sparks).
@@ -40,6 +43,7 @@ const NUM_PEDS = 340;
 const CAR_DRIVER = { a: 2.0, b: 3.0, T: 1.2, s0: 2.0, aLat: 3.5 };
 const BUS_DRIVER = { a: 1.1, b: 2.5, T: 1.5, s0: 2.5, aLat: 2.0 };
 const LOOKAHEAD = 70; // metres a driver looks ahead for vehicles, stop lines and signals
+const PATIENCE = 8; // seconds a driver gives way at an unsignalized corner before it takes turns (see waitedLonger)
 
 // Retire distant actors even when looking their way: keeping them indefinitely starves upcoming streets.
 // Replacements may enter the far view, but nearby visible roads and sidewalks are protected from pop-in.
@@ -207,9 +211,11 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     }
 
     const car = createVehicle(false, isSUV ? 2.3 : 2.25, isSUV ? 0.92 : 0.86, isSUV ? 1.4 : 1.38, CAR_DRIVER, 10 + (i % 5) * 0.9);
-    // paint as float32 values, so renderCar() can tell whether an instance slot's paint changes by comparing
+    // paint as float32 values, so renderCar() can tell whether an instance slot's paint changes by comparing; so is a
+    // patrol car's light bar phase (see lightbarFlash), golden-ratio spaced so no two flash alike
     const paint = [Math.fround(col.r), Math.fround(col.g), Math.fround(col.b)];
-    Object.assign(car, { isTaxi, isPolice, isSUV, bodyType, paint });
+    const strobePhase = isPolice ? Math.fround((policeCount * 0.618034) % 1) : 0;
+    Object.assign(car, { isTaxi, isPolice, isSUV, bodyType, paint, strobePhase });
     cars.push(car);
   }
 
@@ -263,8 +269,13 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     }
   }
 
-  // NYPD roof light bars (the blue & white livery is painted by the sedan material from the instance's carState)
-  const policeLightbarInst = new THREE.InstancedMesh(buildLightbarGeometry(BODY_SPECS.sedan), createLightbarMaterial(), Math.max(1, policeCount));
+  // NYPD roof light bars (the blue & white livery is painted by the sedan material from the instance's carState), each
+  // instance flashing with the strobePhase of the car drawn in it (renderCar), on the cycle update() advances
+  const lightbarGeo = buildLightbarGeometry(BODY_SPECS.sedan);
+  const strobePhases = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, policeCount)), 1);
+  lightbarGeo.setAttribute('strobePhase', strobePhases);
+  const lightbarMat = createLightbarMaterial();
+  const policeLightbarInst = new THREE.InstancedMesh(lightbarGeo, lightbarMat, Math.max(1, policeCount));
   const carShadowInst = new THREE.InstancedMesh(unitPlane, contactShadowMat, NUM_CARS);
   carShadowInst.renderOrder = 998;
 
@@ -650,6 +661,9 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
 
   // Can v, d metres before a line, still stop at it braking no harder than its driver comfortably does?
   const canStopBefore = (v, d) => freeAcc(v) + stopAt(v, d) > -v.driver.b;
+  // ...or braking up to 1.3 times as hard, as stopAt() does nearing the line: a driver who starts giving way at a line
+  // so stays able to all the way in (stopAt() needs at most ~1.2 b on the way, from any speed)
+  const canGiveWay = (v, d) => v.speed * v.speed <= 2.6 * v.driver.b * d;
 
   // Braking for a red (or an amber with room to stop) at the end of edge f, `d` metres ahead
   function signalAhead(v, f, d) {
@@ -739,7 +753,43 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
       if (n.signal ? a.axisIndex === v.edge.axisIndex : a.axisIndex !== 0) continue;
       for (const list of a.occ) {
         const lead = leadOf(list);
-        if (lead && !canStop(lead, a, !n.signal && v.wait > 8)) return true;
+        if (lead && !canStop(lead, a, !n.signal && v.wait > PATIENCE)) return true;
+      }
+    }
+    return false;
+  }
+
+  // The front vehicle of lane list `list` of approach a if it has room to go on and, `atLine`, waits at the line
+  function frontWaiting(a, list, atLine) {
+    const o = leadOf(list);
+    const u = o && o.v;
+    if (!u || u.edge !== a || (atLine && a.len - o.s - u.half >= 2)) return null;
+    const j = u.move.out[u.lane];
+    return j >= 0 && room(u.move.to, j, u) ? u : null;
+  }
+
+  // Giving way must not mean waiting for ever: at an unsignalized corner, once a driver at the line has waited longer
+  // than PATIENCE for the traffic it gives way to (any other road's, or the oncoming traffic for a left turn), that
+  // traffic lets it go first if it has room to go. Drivers kept waiting take turns too: whoever has waited longer goes
+  // first, so a busy side street can't shut out the main road in turn. Is anyone at n's lines waiting for v so? Each
+  // approach takes its turn as one, going by the longest wait among its front drivers (whose lanes merge in their own
+  // order; yieldOncoming() compares a left turn with each of them), so no two drivers ever wait for each other.
+  function waitedLonger(v, n) {
+    const e = v.edge;
+    let kept = 0; // the longest wait at e's front, once needed
+    for (const a of n.in) {
+      const across = a.axisIndex !== e.axisIndex;
+      if (!across && (a !== e.opposite || v.move.turn === 'L')) continue;
+      for (const list of a.occ) {
+        const o = leadOf(list);
+        if (!o || o.v.wait <= Math.max(v.wait, PATIENCE) || (!across && o.v.move.turn !== 'L')) continue;
+        const u = frontWaiting(a, list, true);
+        if (!u) continue;
+        if (!kept) {
+          kept = Math.max(v.wait, PATIENCE);
+          for (const own of e.occ) kept = Math.max(kept, frontWaiting(e, own, false)?.wait || 0);
+        }
+        if (u.wait > kept) return true;
       }
     }
     return false;
@@ -813,12 +863,19 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     return false;
   }
 
-  // Is a bus at the line in the lane on the outside of v's turn? A bus starting to turn swings its tail out over it.
-  function besideTail(v) {
+  // The bus at the line in the lane on the outside of v's turn, if any (a bus starting to turn swings its tail over it)
+  function busOutside(v) {
     const e = v.edge;
     const k = v.lane + (v.move.turn === 'R' ? -1 : 1);
     const o = v.move.turn !== 'S' && k >= 0 && k < e.lanes.length ? leadOf(e.occ[k]) : null;
-    return !!o && o.v.bus && o.v !== v && e.len - o.s - o.v.half < 2;
+    return o && o.v.bus && o.v !== v && e.len - o.s - o.v.half < 2 ? o.v : null;
+  }
+
+  // Must bus v wait for the bus beside its tail? Of two turning away from each other, each beside the other's tail, the
+  // one turning left (the wider turn, swinging its tail out less) goes first.
+  function besideTail(v) {
+    const u = busOutside(v);
+    return !!u && (busOutside(u) !== v || v.move.turn === 'R');
   }
 
   // The lead of another of v's lanes that goes first into lane j of f or, turning where a bus is involved, into a lane
@@ -870,6 +927,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     }
     if (!v.isPolice && (phase === 'red' || (phase === 'amber' && stoppable))) return false;
     if (boxBusy(n, e.axisIndex)) return false; // crossing traffic inside
+    if (!n.signal && canGiveWay(v, d) && waitedLonger(v, n)) return false; // letting them go first
     const lead = ahead(e.occ[v.lane], v.s, v);
     if (lead && lead.v.yielding) return false; // the vehicle ahead waits inside to turn: wait behind the line
     if (v.bus && besideTail(v)) return false; // its tail would swing out over that bus as it starts to turn
@@ -880,7 +938,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     const first = n.signal && (!v.isPolice || phase === 'green') && m.turn !== 'S' && !lead;
     const across = m.turn === 'L' && !!e.opposite;
     const wait = first ? (across ? yieldPoint(v, c, e) : c.len - 3 - v.half) : -1; // < 0: no room inside to wait
-    if (m.turn === 'L' ? across && wait < 0 && yieldOncoming(e.opposite, v.wait > 8, v) : e.opposite && e.opposite.lefts > 0) return false;
+    if (m.turn === 'L' ? across && wait < 0 && yieldOncoming(e.opposite, v.wait > PATIENCE, v) : e.opposite && e.opposite.lefts > 0) return false;
     if ((n.signal ? v.isPolice && phase !== 'green' : e.axisIndex !== 0) && yieldToCrossTraffic(v, n)) return false;
     // nobody on the crosswalks while it passes over them, on the way in and on the way out, and a free place to
     // clear the intersection to, taking turns with lanes merging into it
@@ -960,8 +1018,17 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     return freeAcc(v) + worst;
   }
 
-  // Fastest v can take curve c at without exceeding the sideways acceleration its driver accepts
-  const bendSpeed = (v, c) => Math.sqrt(v.driver.aLat / Math.max(c.curv, 1e-3));
+  // Fastest v, its centre cs metres along curve c (< 0: still before it), can go to take each bend of c without
+  // exceeding the sideways acceleration its driver accepts: the bends between its axles now, and the bends ahead after
+  // easing off for them at 2.5 m/s². Where a turn is sharpest at one end, it needn't crawl all the way round.
+  function bendSpeed(v, c, cs) {
+    let v2 = Infinity;
+    for (let k = 0; k <= 16; k++) {
+      const ahead = c.lut[k] - cs - v.axle; // from its front axle
+      if (ahead > -2 * v.axle) v2 = Math.min(v2, v.driver.aLat / Math.max(c.bend[k], 1e-3) + 5 * Math.max(0, ahead));
+    }
+    return Math.sqrt(v2);
+  }
 
   // IDM acceleration for vehicles ahead in the lane (and, through the intersection, in the lane it leads to),
   // the stop line while v may not go, a red beyond, the player, and slowing down for turns and give-way lines
@@ -992,10 +1059,10 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
         // then the others wait for v)
         const o = c && !v.claimed && mergingAhead(v, f, j);
         if (o) worst = Math.min(worst, Math.max(-v.driver.b, brake(v, o.s - o.v.half - vs - v.half, o.v.speed)));
-        let vt = c ? bendSpeed(v, c) : Infinity;
+        // slowing down for the bends of its way through and, giving way, to 5 m/s at the line
+        cap = c ? bendSpeed(v, c, v.s - e.len) : Infinity;
         const cautious = e.to.signal ? v.isPolice && phaseOf(e) !== 'green' : e.axisIndex !== 0;
-        if (cautious) vt = Math.min(vt, 5);
-        cap = Math.sqrt(vt * vt + 5 * Math.max(0, d));
+        if (cautious) cap = Math.min(cap, Math.sqrt(25 + 5 * Math.max(0, d)));
       }
     } else {
       const f = v.move.to;
@@ -1010,7 +1077,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
         if (v.yielding) cross(v);
         if (peds) worst = Math.min(worst, stopAt(v, d, 0.5));
       }
-      cap = bendSpeed(v, v.conn);
+      cap = bendSpeed(v, v.conn, v.cs);
     }
     const pg = playerGap(v, 0);
     if (pg < LOOKAHEAD) {
@@ -1412,6 +1479,9 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   const QUEUE_GAP = 0.62; // m from one person standing in a queue to the next
   const curbNodes = [];
   const curbProgress = (p) => (p.dir > 0 ? p.t : p.len - p.t); // m along its way over (the curb it waits at is KERB)
+  // Not past the line it waits at yet. Coming from the far end, p.len - t rounds to a hair over KERB at
+  // t = p.len - KERB (where it stands waiting) for most crosswalk lengths.
+  const beforeKerb = (p) => curbProgress(p) <= KERB + 1e-6;
   function atCurb(p) {
     const crossing = !p.node && p.nextRoute?.find((leg, i) => i >= p.nextLeg && leg.track.node);
     const n = p.node || crossing?.track.node;
@@ -1550,7 +1620,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     if (p.node) {
       // room to walk before standing: up to the curb unless p may cross, and up to the back of whoever is ahead
       const s = curbProgress(p);
-      room = s <= KERB && !mayCross(p) ? KERB - s : Infinity;
+      room = beforeKerb(p) && !mayCross(p) ? Math.max(0, KERB - s) : Infinity;
       for (const q of p.node.curb) {
         if (q === p || q.node !== p.node || q.side !== p.side || q.dir !== p.dir || Math.abs(q.line - p.line) > 0.55) continue;
         const gap = curbProgress(q) - s;
@@ -1562,7 +1632,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     const movement = Math.min(p.v * dt, room);
     if (p.v * dt > room) p.v = 0;
     let t = p.t + p.dir * movement;
-    const reachesCurb = !!p.node && curbProgress(p) <= KERB && (p.dir > 0 ? t : p.len - t) >= KERB - 1e-6;
+    const reachesCurb = !!p.node && beforeKerb(p) && (p.dir > 0 ? t : p.len - t) >= KERB - 1e-6;
     p.waiting = reachesCurb && !mayCross(p);
     if (p.waiting) {
       t = p.dir > 0 ? Math.min(t, KERB) : Math.max(t, p.len - KERB);
@@ -1654,6 +1724,8 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   let wheelCars = 0;
   let visibleCars = 0;
   let policeDrawn = 0;
+  let strobeDirty = false; // a light bar instance now shows another car's phase
+  let lightbarCycle = 0; // how far (0-1) into their flash cycle the light bars are (lightbarFlash)
   let visibleBuses = 0;
   let updates = 0;
 
@@ -1711,7 +1783,14 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     dummy.scale.set(1, 1, 1);
     dummy.updateMatrix();
     bodyInst.setMatrixAt(slot, dummy.matrix);
-    if (c.isPolice) policeLightbarInst.setMatrixAt(policeDrawn++, dummy.matrix);
+    if (c.isPolice) {
+      const bar = policeDrawn++;
+      policeLightbarInst.setMatrixAt(bar, dummy.matrix);
+      if (strobePhases.array[bar] !== c.strobePhase) {
+        strobePhases.array[bar] = c.strobePhase;
+        strobeDirty = true;
+      }
+    }
 
     const attrs = bodyInst.geometry.attributes;
     const paint = attrs.paintColor.array;
@@ -1867,22 +1946,21 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
       spot.position.set(0, -1000, 0);
     }
 
-    // 1. NYPD emergency roof lightbar flashes (smoothly pulsing red/blue 360° PointLights on nearby patrol cruisers)
+    // 1. NYPD emergency roof lightbar flashes (red/blue 360° PointLights on nearby patrol cruisers, flashing with the
+    //    lenses: the same cycle and the car's own phase)
     let policeLightsUsed = 0;
     for (let i = 0; i < litVehicleCount && policeLightsUsed < POLICE_LIGHT_POOL_SIZE; i++) {
       const v = litVehicles[i];
       if (!v.isPolice || v._effDist >= 88) continue;
       const fade = smoothDistFade(v._effDist, 52, 88);
       if (fade <= 0.001) continue;
-      const wave = Math.sin((clock + v.blinkPhase) * Math.PI * 6.0);
-      const redPhase = wave >= 0;
-      const pulse = 0.35 + 0.65 * Math.abs(wave);
-      const side = redPhase ? -0.36 : 0.36;
+      const flash = lightbarFlash(lightbarCycle, v.strobePhase); // -1 red half lit, 1 blue half, 0 between flashes
+      const side = flash < 0 ? -0.36 : 0.36;
       const pt = policeLightPool[policeLightsUsed++];
-      pt.color.setHex(redPhase ? 0xff1828 : 0x1868ff);
+      pt.color.setHex(flash < 0 ? 0xff1828 : 0x1868ff);
       pt.position.set(v.x + side * v._cosY - 0.25 * v._sinY, 1.85, v.z - side * v._sinY - 0.25 * v._cosY);
       pt.distance = 12.0;
-      pt.intensity = 42.0 * tailScale * fade * pulse;
+      pt.intensity = flash !== 0 ? 42.0 * tailScale * fade : 0;
     }
     for (let i = policeLightsUsed; i < POLICE_LIGHT_POOL_SIZE; i++) {
       const pt = policeLightPool[i];
@@ -1956,6 +2034,8 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
 
   function update(dt, elapsed, focusPos = null, playerEntity = null, activeMode = 'car', camera = null) {
     clock = elapsed;
+    lightbarCycle = (elapsed * LIGHTBAR_RATE) % 1;
+    lightbarMat.userData.cycle.value = lightbarCycle;
     avePhase = signalPhase(elapsed, true);
     stPhase = signalPhase(elapsed, false);
     aveWalk = walkSignal(elapsed, true);
@@ -2055,6 +2135,8 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     syncInst(carWheelLeftInst, wheelCars * 2);
     syncInst(carWheelRightInst, wheelCars * 2);
     syncInst(policeLightbarInst, policeDrawn);
+    if (strobeDirty) flagRange(strobePhases, policeDrawn);
+    strobeDirty = false;
     syncInst(carShadowInst, visibleCars);
     syncInst(busBodyInst, visibleBuses);
     syncInst(busHeaderInst, visibleBuses);
@@ -2201,10 +2283,35 @@ function createHighwayTraffic(scene, lanes) {
   const flares = new THREE.Mesh(flareGeo, createCarFlareMaterial());
   flares.name = 'HighwayLampFlares';
   flares.frustumCulled = false;
-  flares.visible = false;
   flares.renderOrder = 2;
   group.add(flares);
   let flareCount = 0;
+  function addFlare(px, py, pz, size, r, g, b) {
+    const o = flareCount * 4;
+    flarePos[o] = px;
+    flarePos[o + 1] = py;
+    flarePos[o + 2] = pz;
+    flarePos[o + 3] = size;
+    const k = flareCount * 4;
+    flareCol[k] = r;
+    flareCol[k + 1] = g;
+    flareCol[k + 2] = b;
+    flareCount++;
+  }
+  const flareFacing = (f) => { const t = Math.min(1, Math.max(0, (f + 0.3) / 0.9)); return t * t * (3 - 2 * t); };
+  // Draws the flares added since the count was reset, uploading just those. With none (by day) the mesh is hidden,
+  // except while `warming`: until the shader precompile & warm-up frame (main.js) have seen it, one empty flare keeps
+  // it drawn (no other mesh uses its material), so its pipeline is built behind the loading screen, not at dusk.
+  function showFlares(warming) {
+    if (flareCount === 0 && warming) addFlare(0, 0, 0, 0, 0, 0, 0);
+    flares.visible = flareCount > 0;
+    flares.count = flareCount;
+    if (flareCount > 0) {
+      flagRange(flareGeo.attributes.flarePos, flareCount);
+      flagRange(flareGeo.attributes.flareCol, flareCount);
+    }
+  }
+  showFlares(true);
 
   // Clustered SpotLight pool for nearby highway cars (within 105 m)
   const HWY_SPOT_POOL = 28;
@@ -2224,19 +2331,6 @@ function createHighwayTraffic(scene, lanes) {
   }
   const hwyLitCars = [];
   let hwyLitCount = 0;
-  function addFlare(px, py, pz, size, r, g, b) {
-    const o = flareCount * 4;
-    flarePos[o] = px;
-    flarePos[o + 1] = py;
-    flarePos[o + 2] = pz;
-    flarePos[o + 3] = size;
-    const k = flareCount * 4;
-    flareCol[k] = r;
-    flareCol[k + 1] = g;
-    flareCol[k + 2] = b;
-    flareCount++;
-  }
-  const flareFacing = (f) => { const t = Math.min(1, Math.max(0, (f + 0.3) / 0.9)); return t * t * (3 - 2 * t); };
 
   const D = HWY_DRIVER;
   const brakeTerm = 2 * Math.sqrt(D.a * D.b);
@@ -2435,12 +2529,7 @@ function createHighwayTraffic(scene, lanes) {
     }
     dirtyPaint.clear();
     dirtyState.clear();
-    flares.visible = flareCount > 0;
-    flares.count = flareCount;
-    if (flareCount > 0) {
-      flagRange(flareGeo.attributes.flarePos, flareCount);
-      flagRange(flareGeo.attributes.flareCol, flareCount);
-    }
+    showFlares(!hideEmpty);
 
     // Update clustered highway SpotLights (dual left/right beams for nearby cars)
     hwyLitCars.length = hwyLitCount;

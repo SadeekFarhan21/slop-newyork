@@ -108,3 +108,74 @@ test('live sparks preserve motion, bounce and fade while packing only live matri
   assert.equal(h.sparkInst.visible, false);
   assert.equal(h.uploads(), uploads);
 });
+
+// The highway lamp flares (createHighwayTraffic) as built, with a recording attribute in place of the GPU buffer
+function flareHarness() {
+  const block = source.match(/^ {2}const flarePos = new Float32Array[\s\S]*?^ {2}showFlares\(true\);$/m)?.[0];
+  assert.ok(block, 'the flare setup is present');
+  const uploads = [];
+  class InstancedBufferAttribute {
+    constructor(array, itemSize) { Object.assign(this, { array, itemSize, range: 0 }); }
+    clearUpdateRanges() { this.range = 0; }
+    addUpdateRange(offset, count) { assert.equal(offset, 0); this.range = count; }
+    set needsUpdate(value) { if (value) uploads.push({ attribute: this, range: this.range }); }
+  }
+  const THREE = {
+    InstancedBufferAttribute,
+    PlaneGeometry: class { constructor() { this.attributes = {}; } setAttribute(name, a) { this.attributes[name] = a; } },
+    Mesh: class { constructor(geometry, material) { Object.assign(this, { geometry, material, visible: true }); } }
+  };
+  const context = {
+    THREE, cars: [{}, {}, {}], group: { add() {} }, createCarFlareMaterial: () => ({}),
+    flagRange: productionFunction('flagRange', {})
+  };
+  const h = vm.runInNewContext(`(() => {\n${block}\nreturn { flares, flarePos, flareCol, addFlare, showFlares, reset: () => { flareCount = 0; } };\n})()`, context);
+  return { ...h, uploads };
+}
+
+test('highway lamp flares are drawn from the start, empty, so the shader warm-up compiles them', () => {
+  const h = flareHarness();
+  assert.equal(h.flares.visible, true);
+  assert.equal(h.flares.count, 1);
+  assert.deepEqual([...h.flarePos.slice(0, 4)], [0, 0, 0, 0], 'a zero-size flare');
+  assert.deepEqual([...h.flareCol.slice(0, 3)], [0, 0, 0], 'adding no light');
+  assert.deepEqual(h.uploads.map((u) => u.range), [4, 4]);
+});
+
+test('by day the flares stay drawn through the warm-up frames, then hide and upload nothing', () => {
+  const h = flareHarness();
+  h.flarePos.fill(7); // whatever earlier nights left behind
+  for (const warming of [true, true]) {
+    h.reset();
+    h.showFlares(warming);
+    assert.equal(h.flares.visible, true);
+    assert.equal(h.flares.count, 1);
+    assert.equal(h.flarePos[3], 0, 'the stand-in is always empty');
+  }
+  const uploads = h.uploads.length;
+  for (let frame = 0; frame < 30; frame++) {
+    h.reset();
+    h.showFlares(false);
+  }
+  assert.equal(h.flares.visible, false);
+  assert.equal(h.flares.count, 0);
+  assert.equal(h.uploads.length, uploads);
+});
+
+test('at night every flare added is drawn and uploaded, with no stand-in', () => {
+  const h = flareHarness();
+  for (const warming of [true, false]) {
+    h.reset();
+    h.addFlare(1, 2, 3, 0.8, 4, 4, 3);
+    h.addFlare(5, 6, 7, 0.8, 3, 0.2, 0.1);
+    h.showFlares(warming);
+    assert.equal(h.flares.visible, true);
+    assert.equal(h.flares.count, 2);
+    assert.deepEqual([...h.flarePos.slice(0, 4)], [1, 2, 3, Math.fround(0.8)]);
+    assert.deepEqual(h.uploads.slice(-2).map((u) => u.range), [8, 8]);
+  }
+});
+
+test('the highway traffic keeps the flares warming for exactly the frames its meshes stay drawn', () => {
+  assert.match(source, /const hideEmpty = \+\+updates > 2;\n {4}for \(const kind of KINDS\) \{[^]*?\n {4}showFlares\(!hideEmpty\);\n/);
+});
