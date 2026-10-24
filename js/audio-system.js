@@ -3,6 +3,11 @@ import { createEventResources, playEvent, createWindVoice } from './audio-events
 import { CityAudioSources } from './audio-sources.js';
 import { CityAcoustics } from './audio-acoustics.js';
 
+// Input that can carry user activation. Touch and pen activate on release (pointerup, touchend, then click), and
+// capture runs before the touch controls stop propagation of joystick and button presses.
+const GESTURES = ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'];
+const GESTURE_OPTIONS = { capture: true, passive: true };
+
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const smooth = (param, value, now, time = 0.035, immediate = false) => {
   param.cancelScheduledValues(now);
@@ -100,6 +105,9 @@ class CityAudioSystem {
     this.motors = new Map();
     this.sirens = new Map();
     this.events = [];
+    this.outgoing = [];
+    this.silentAt = 0;
+    this.suspendTimer = 0;
     this.states = new WeakMap();
     this.conversations = new WeakMap();
     this.listener = { x: 0, y: 0, z: 0 };
@@ -115,7 +123,10 @@ class CityAudioSystem {
     this.windParams = { speed: 0, altitude: 0, night: 0, traffic: 0, enclosure: 0 };
     this.footPosition = { x: 0, y: 0, z: 0, seed: 0 };
     this.onGesture = (event) => {
-      if (event.type === 'keydown' && (event.repeat || event.metaKey || event.ctrlKey || /INPUT|TEXTAREA|SELECT/.test(event.target?.tagName))) return;
+      // Only activation can start audio: a touch or pen pointerdown never carries it, and neither does Escape.
+      if (event.type === 'pointerdown' && event.pointerType !== 'mouse') return;
+      if (event.type === 'keydown' && (event.repeat || event.metaKey || event.ctrlKey || event.key === 'Escape'
+        || /INPUT|TEXTAREA|SELECT/.test(event.target?.tagName))) return;
       if (this.enabled) this.unlock();
     };
     this.onVisibility = () => {
@@ -124,8 +135,7 @@ class CityAudioSystem {
       else if (this.enabled && this.context) this.unlock();
     };
     // Keep gesture handlers: iOS can interrupt a previously running context, and resuming may need another tap.
-    document.addEventListener('pointerdown', this.onGesture, { passive: true });
-    document.addEventListener('keydown', this.onGesture);
+    for (const type of GESTURES) document.addEventListener(type, this.onGesture, GESTURE_OPTIONS);
     document.addEventListener('visibilitychange', this.onVisibility);
   }
 
@@ -194,30 +204,49 @@ class CityAudioSystem {
   }
 
   suspend() {
-    if (!this.context || this.context.state === 'closed') return;
-    // Visibility/mute can change again while suspend is pending. Reconcile after it settles so a rapid unmute
-    // cannot leave an enabled system suspended merely because resume saw the old 'running' state.
-    return this.context.suspend().then(() => {
-      if (this.enabled && !document.hidden && !this.disposed) this.unlock();
-    }).catch(() => {});
+    if (!this.context || this.disposed || this.context.state === 'closed') return;
+    // Stopping the output mid-waveform clicks too, so let the master finish fading out first (see reset()).
+    clearTimeout(this.suspendTimer);
+    const fade = this.context.state === 'running' ? Math.max(0, this.silentAt - this.context.currentTime) : 0;
+    this.suspendTimer = setTimeout(() => {
+      this.suspendTimer = 0;
+      if (this.disposed || (this.enabled && !document.hidden)) return; // Unmuted or shown again during the fade.
+      // Visibility/mute can change again while suspend is pending. Reconcile after it settles so a rapid unmute
+      // cannot leave an enabled system suspended merely because resume saw the old 'running' state.
+      this.context.suspend().then(() => {
+        this.releaseOutgoing(); // Rendering has stopped, so this is silent.
+        if (this.enabled && !document.hidden && !this.disposed) this.unlock();
+      }).catch(() => {});
+    }, fade * 1000);
   }
 
+  // Replaces the whole soundscape (a teleport or camera jump, mute or a hidden page). Stopping voices or stepping
+  // the master while they are audible clicks, so they fade out with the master and are released only once silent;
+  // update() holds new voices back until then and fades the master in again from silence.
   reset() {
     for (const pool of [this.motors, this.sirens]) {
-      for (const slot of pool.values()) { slot.voice.dispose(); slot.emitter.dispose(); }
+      for (const slot of pool.values()) this.outgoing.push(slot);
       pool.clear();
     }
-    for (const event of this.events) { event.voice.dispose(true); event.emitter.dispose(); }
+    for (const event of this.events) this.outgoing.push(event);
     this.events.length = 0;
     this.conversations = new WeakMap();
     this.states = new WeakMap();
     this.collisionPairs = new WeakMap();
     this.haveListener = false;
     this.accumulator = 0;
-    if (this.master) {
-      this.master.gain.cancelScheduledValues(this.context.currentTime);
-      this.master.gain.setValueAtTime(0, this.context.currentTime);
-    }
+    if (!this.master) return;
+    const now = this.context.currentTime;
+    const rendering = this.context.state === 'running';
+    // Nothing is rendered while suspended or interrupted: release at once, and resume from silence.
+    smooth(this.master.gain, 0, now, 0.015, !rendering);
+    if (rendering) this.silentAt = now + 0.08;
+    else this.releaseOutgoing();
+  }
+
+  releaseOutgoing() {
+    for (const { voice, emitter } of this.outgoing) { voice.dispose(true); emitter.dispose(); }
+    this.outgoing.length = 0;
   }
 
   state(source, now) {
@@ -382,7 +411,7 @@ class CityAudioSystem {
   }
 
   honk(entity) {
-    if (!this.ready || !this.enabled || this.context?.state !== 'running' || entity?.type !== 'car') return;
+    if (!this.ready || !this.enabled || !this.haveListener || this.context?.state !== 'running' || entity?.type !== 'car') return;
     const now = this.context.currentTime;
     if (now - this.lastHorn < 0.8) return;
     if (this.emit('horn', { id: entity, ...entity.position, heading: entity.heading, seed: 4 }, { intensity: 0.7 })) this.lastHorn = now;
@@ -397,6 +426,10 @@ class CityAudioSystem {
     const now = this.context.currentTime;
     const position = camera.position;
     if (this.haveListener && Math.hypot(position.x - this.listener.x, position.y - this.listener.y, position.z - this.listener.z) > 60) this.reset();
+    // New voices wait for the old ones to fade out after a reset: the graph never doubles, and smoothing the
+    // master below in the same tick would cancel its fade-out.
+    if (now < this.silentAt) return;
+    if (this.outgoing.length) this.releaseOutgoing();
     this.listener.x = position.x; this.listener.y = position.y; this.listener.z = position.z;
     camera.updateMatrixWorld();
     const m = camera.matrixWorld.elements;
@@ -496,11 +529,12 @@ class CityAudioSystem {
 
   dispose() {
     this.disposed = true;
+    clearTimeout(this.suspendTimer);
     for (const system of this.collisionSystems) system.setCollisionListener?.(null);
-    document.removeEventListener('pointerdown', this.onGesture);
-    document.removeEventListener('keydown', this.onGesture);
+    for (const type of GESTURES) document.removeEventListener(type, this.onGesture, GESTURE_OPTIONS);
     document.removeEventListener('visibilitychange', this.onVisibility);
     this.reset();
+    this.releaseOutgoing(); // The context closes now; there is no time left to fade.
     this.wind?.dispose(true);
     for (const node of [this.mix, this.compressor, this.master, this.reflections, this.reverb, this.reflectionFilter]) node?.disconnect();
     if (this.context) {
