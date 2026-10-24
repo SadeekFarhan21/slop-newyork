@@ -55,7 +55,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..800&amp;family=Overpass:wght@600;700&amp;display=swap" />
-  <link rel="stylesheet" href="./css/style.css?v=20261022-repo-link" />
+  <link rel="stylesheet" href="./css/style.css?v=20261024-hud-fixes" />
 </head>
 <body>
   <!-- Icon sprite (24 × 24 stroke icons, drawn in currentColor) -->
@@ -110,7 +110,7 @@
           <h1>Slop New York</h1>
           <a class="repo-link" href="https://github.com/mrdoob/slop-newyork/" target="_blank" rel="noopener noreferrer" aria-label="Slop New York on GitHub (opens in a new tab)">GitHub <span aria-hidden="true">↗</span></a>
         </div>
-        <div class="brand-subtitle">three.js · WebGPU · TSL · <span id="hud-fps" class="fps-ok">60</span> fps</div>
+        <div class="brand-subtitle">three.js · <span id="hud-backend">WebGPU</span> · TSL · <span id="hud-fps" class="fps-ok">60</span> fps</div>
       </div>
     </div>
   </header>
@@ -119,16 +119,16 @@
   <div class="hud hud-top-right">
     <div id="hud-toolbar" class="panel toolbar">
       <div class="time-switch" role="group" aria-label="Atmosphere &amp; time of day">
-        <button id="time-golden" class="time-btn active" data-time="golden" type="button" title="Golden Hour">
+        <button id="time-golden" class="time-btn active" data-time="golden" type="button" title="Golden Hour" aria-pressed="true">
           <svg class="icon" aria-hidden="true"><use href="#i-golden"/></svg><span class="seg-label">Golden Hour</span>
         </button>
-        <button id="time-midday" class="time-btn" data-time="midday" type="button" title="Sunny Midday">
+        <button id="time-midday" class="time-btn" data-time="midday" type="button" title="Sunny Midday" aria-pressed="false">
           <svg class="icon" aria-hidden="true"><use href="#i-sun"/></svg><span class="seg-label">Midday</span>
         </button>
-        <button id="time-twilight" class="time-btn" data-time="twilight" type="button" title="Blue Hour">
+        <button id="time-twilight" class="time-btn" data-time="twilight" type="button" title="Blue Hour" aria-pressed="false">
           <svg class="icon" aria-hidden="true"><use href="#i-twilight"/></svg><span class="seg-label">Blue Hour</span>
         </button>
-        <button id="time-midnight" class="time-btn" data-time="midnight" type="button" title="Night 23:00">
+        <button id="time-midnight" class="time-btn" data-time="midnight" type="button" title="Night 23:00" aria-pressed="false">
           <svg class="icon" aria-hidden="true"><use href="#i-moon"/></svg><span class="seg-label">Night</span>
         </button>
       </div>
@@ -177,16 +177,16 @@
     <div id="hud-controls-hint" class="controls-hint"></div>
     <nav id="mode-switch" class="panel mode-switch" aria-label="Third-Person Navigation Mode">
       <span class="mode-indicator" aria-hidden="true"></span>
-      <button id="mode-person" class="mode-btn" data-mode="person" type="button" title="Person [1]">
+      <button id="mode-person" class="mode-btn" data-mode="person" type="button" title="Person [1]" aria-pressed="false">
         <svg class="icon" aria-hidden="true"><use href="#i-walk"/></svg><span class="mode-label">Walk</span><kbd>1</kbd>
       </button>
-      <button id="mode-car" class="mode-btn active" data-mode="car" type="button" title="Car · Yellow Cab [2]">
+      <button id="mode-car" class="mode-btn active" data-mode="car" type="button" title="Car · Yellow Cab [2]" aria-pressed="true">
         <svg class="icon" aria-hidden="true"><use href="#i-car"/></svg><span class="mode-label">Drive</span><kbd>2</kbd>
       </button>
-      <button id="mode-cyclist" class="mode-btn" data-mode="cyclist" type="button" title="Cyclist [3]">
+      <button id="mode-cyclist" class="mode-btn" data-mode="cyclist" type="button" title="Cyclist [3]" aria-pressed="false">
         <svg class="icon" aria-hidden="true"><use href="#i-bike"/></svg><span class="mode-label">Cycle</span><kbd>3</kbd>
       </button>
-      <button id="mode-helicopter" class="mode-btn" data-mode="helicopter" type="button" title="Helicopter [4]">
+      <button id="mode-helicopter" class="mode-btn" data-mode="helicopter" type="button" title="Helicopter [4]" aria-pressed="false">
         <svg class="icon" aria-hidden="true"><use href="#i-heli"/></svg><span class="mode-label">Fly</span><kbd>4</kbd>
       </button>
     </nav>
@@ -243,18 +243,18 @@
   <!-- All Cameras: 3 Follow Cameras + 7 Iconic NYC Vantage Cameras + Auto-Director Drone -->
   <div id="camera-popover" class="popover" popover data-side="above" data-anchor="hud-cluster" data-align="hud-cluster" aria-label="Multiple Camera Angles">
     <div class="pop-title">Follow</div>
-    <button id="cam-chase" class="pop-item cam-btn active" data-camera="chase" type="button"><span class="pop-name">3rd-Person Chase</span><kbd>5</kbd></button>
-    <button id="cam-action" class="pop-item cam-btn" data-camera="action" type="button"><span class="pop-name">Low-Angle Action</span><kbd>6</kbd></button>
-    <button id="cam-pov" class="pop-item cam-btn" data-camera="pov" type="button"><span class="pop-name">First-Person / Cockpit</span><kbd>7</kbd></button>
+    <button id="cam-chase" class="pop-item cam-btn active" data-camera="chase" type="button" aria-pressed="true"><span class="pop-name">3rd-Person Chase</span><kbd>5</kbd></button>
+    <button id="cam-action" class="pop-item cam-btn" data-camera="action" type="button" aria-pressed="false"><span class="pop-name">Low-Angle Action</span><kbd>6</kbd></button>
+    <button id="cam-pov" class="pop-item cam-btn" data-camera="pov" type="button" aria-pressed="false"><span class="pop-name">First-Person / Cockpit</span><kbd>7</kbd></button>
     <div class="pop-title">Scenic</div>
-    <button id="cam-centralPark" class="pop-item cam-btn" data-camera="centralPark" type="button"><span class="pop-name">Central Park Oasis</span></button>
-    <button id="cam-fifthAve" class="pop-item cam-btn" data-camera="fifthAve" type="button"><span class="pop-name">5th Ave &amp; Empire State</span><kbd>8</kbd></button>
-    <button id="cam-timesSquare" class="pop-item cam-btn" data-camera="timesSquare" type="button"><span class="pop-name">Times Square Crossroads</span><kbd>9</kbd></button>
-    <button id="cam-chryslerGCT" class="pop-item cam-btn" data-camera="chryslerGCT" type="button"><span class="pop-name">42nd St · Chrysler &amp; GCT</span><kbd>0</kbd></button>
-    <button id="cam-observatory" class="pop-item cam-btn" data-camera="observatory" type="button"><span class="pop-name">Empire State 86th Deck</span></button>
-    <button id="cam-bryantPark" class="pop-item cam-btn" data-camera="bryantPark" type="button"><span class="pop-name">Bryant Park &amp; NYPL</span></button>
-    <button id="cam-waterfront" class="pop-item cam-btn" data-camera="waterfront" type="button"><span class="pop-name">East River &amp; Skyline</span></button>
-    <button id="cam-drone" class="pop-item cam-btn" data-camera="drone" type="button"><span class="pop-name">Auto-Director Aerial</span></button>
+    <button id="cam-centralPark" class="pop-item cam-btn" data-camera="centralPark" type="button" aria-pressed="false"><span class="pop-name">Central Park Oasis</span></button>
+    <button id="cam-fifthAve" class="pop-item cam-btn" data-camera="fifthAve" type="button" aria-pressed="false"><span class="pop-name">5th Ave &amp; Empire State</span><kbd>8</kbd></button>
+    <button id="cam-timesSquare" class="pop-item cam-btn" data-camera="timesSquare" type="button" aria-pressed="false"><span class="pop-name">Times Square Crossroads</span><kbd>9</kbd></button>
+    <button id="cam-chryslerGCT" class="pop-item cam-btn" data-camera="chryslerGCT" type="button" aria-pressed="false"><span class="pop-name">42nd St · Chrysler &amp; GCT</span><kbd>0</kbd></button>
+    <button id="cam-observatory" class="pop-item cam-btn" data-camera="observatory" type="button" aria-pressed="false"><span class="pop-name">Empire State 86th Deck</span></button>
+    <button id="cam-bryantPark" class="pop-item cam-btn" data-camera="bryantPark" type="button" aria-pressed="false"><span class="pop-name">Bryant Park &amp; NYPL</span></button>
+    <button id="cam-waterfront" class="pop-item cam-btn" data-camera="waterfront" type="button" aria-pressed="false"><span class="pop-name">East River &amp; Skyline</span></button>
+    <button id="cam-drone" class="pop-item cam-btn" data-camera="drone" type="button" aria-pressed="false"><span class="pop-name">Auto-Director Aerial</span></button>
   </div>
 
   <!-- Full-Screen Interactive New York City Street Map ([M]) -->

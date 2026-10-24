@@ -77,13 +77,18 @@ function mapHarness() {
   const controls = eventTarget();
   const wrapper = { classList: classList() };
   const zoomIn = eventTarget(), zoomOut = eventTarget();
+  const search = {
+    ...eventTarget(), tagName: 'INPUT', value: '',
+    blur() { if (document.activeElement === search) document.activeElement = document.body; }
+  };
+  const modal = { classList: classList(), contains: (node) => node === search };
   const elements = {
-    'fullmap-canvas': canvas, 'fullmap-canvas-wrap': wrapper,
-    'fullmap-modal': { classList: classList() },
+    'fullmap-canvas': canvas, 'fullmap-canvas-wrap': wrapper, 'fullmap-modal': modal, 'fullmap-search': search,
     'map-zoom-in': zoomIn, 'map-zoom-out': zoomOut
   };
+  const body = { tagName: 'BODY' };
   const document = {
-    ...eventTarget(), hidden: false,
+    ...eventTarget(), hidden: false, body, activeElement: body,
     getElementById: (id) => elements[id] || null,
     querySelectorAll: () => []
   };
@@ -99,7 +104,7 @@ function mapHarness() {
     ISLAND_BOUNDS: { minX: -10000, maxX: 10000, minZ: -10000, maxZ: 10000 },
     getIslandBoundsAtZ: () => ({ westX: -10000, eastX: 10000 }),
     getLocationLabel: (x, z) => `${x}, ${z}`,
-    isTypingInField: () => false
+    isTypingInField: (event) => event.target?.tagName === 'INPUT'
   };
   const { NYCMapSystem } = loadModule(source, {
     globals: { window, document },
@@ -116,14 +121,52 @@ function mapHarness() {
   map.viewZoom = 1;
   map.toggleFullMap(true);
   return {
-    map, canvas, controls, wrapper, window, document, captured, teleports, toggles, zoomIn, zoomOut,
+    map, canvas, controls, wrapper, window, document, search, captured, teleports, toggles, zoomIn, zoomOut,
     pointer(target, type, id, x = 110, y = 120, pointerType = 'touch', button = 0) {
       const event = { pointerId: id, clientX: x, clientY: y, pointerType, button, preventDefault() {} };
       (captured.has(id) ? canvas : target).dispatch(type, event);
       window.dispatch(type, event);
+    },
+    key(code, modifiers = {}) {
+      const event = { code, repeat: false, metaKey: false, ctrlKey: false, altKey: false, target: { tagName: 'BODY' } };
+      window.dispatch('keydown', { ...event, ...modifiers });
     }
   };
 }
+
+test('M toggles the map once per press, never on key repeat or as part of a Cmd, Ctrl or Alt shortcut', () => {
+  const h = mapHarness();
+  assert.equal(h.map.isFullMapOpen, true);
+  for (let i = 0; i < 5; i++) h.key('KeyM', { repeat: true });
+  assert.equal(h.map.isFullMapOpen, true, 'holding M leaves the map as the press set it');
+  for (const modifier of ['metaKey', 'ctrlKey', 'altKey']) h.key('KeyM', { [modifier]: true });
+  assert.equal(h.map.isFullMapOpen, true, 'Cmd+M minimizes the window instead');
+  h.key('KeyM', { target: { tagName: 'INPUT' } });
+  assert.equal(h.map.isFullMapOpen, true, 'an M typed into the search stays there');
+  h.key('KeyM');
+  assert.equal(h.map.isFullMapOpen, false);
+  h.key('KeyM', { repeat: true });
+  assert.equal(h.map.isFullMapOpen, false);
+  h.key('KeyM');
+  h.key('Escape');
+  assert.equal(h.map.isFullMapOpen, false, 'Esc closes the map');
+  assert.deepEqual(h.toggles, [true, false, true, false]);
+});
+
+test('closing the map hands the keyboard back from its search box to the player', () => {
+  const h = mapHarness();
+  h.document.activeElement = h.search;
+  h.key('Escape', { target: h.search });
+  assert.equal(h.map.isFullMapOpen, false);
+  assert.equal(h.document.activeElement, h.document.body, 'WASD drive again rather than typing into the hidden search');
+
+  // Focus outside the map stays where it is
+  const button = { tagName: 'BUTTON', blur: () => assert.fail('only the map lets go of the focus') };
+  h.map.toggleFullMap(true);
+  h.document.activeElement = button;
+  h.map.toggleFullMap(false);
+  assert.equal(h.document.activeElement, button);
+});
 
 test('unrelated touches cannot move or release the map pan', () => {
   const h = mapHarness();

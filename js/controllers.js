@@ -269,6 +269,7 @@ class ThirdPersonControllerManager {
     this._keyboardKeys = {};
     this._touchKeys = {};
     this._gamepadKeys = {};
+    this._keyboardEnabled = true;
 
     const onKey = (e, isDown) => {
       // macOS sends no keyup for a key let go while Cmd is down, so no held key can be trusted once Cmd is released
@@ -277,8 +278,9 @@ class ThirdPersonControllerManager {
         return;
       }
       const action = actionsByCode.get(e.code);
-      // Presses don't count while typing in a field or as part of a Cmd / Ctrl shortcut; releases always do
-      if (!action || (isDown && (e.metaKey || e.ctrlKey || isTypingInField(e)))) return;
+      // Presses don't count while the keyboard is off (the full-screen map), typing in a field, or part of a Cmd / Ctrl
+      // shortcut; releases always do
+      if (!action || (isDown && (!this._keyboardEnabled || e.metaKey || e.ctrlKey || isTypingInField(e)))) return;
       if (isDown) this._pressedCodes.add(e.code);
       else this._pressedCodes.delete(e.code);
       // Releasing one binding must not cancel another key held for the same action.
@@ -332,6 +334,12 @@ class ThirdPersonControllerManager {
     this._pressedCodes.clear();
     this._keyboardKeys = {};
     for (const action of Object.keys(this.keys)) this._blendInput(action);
+  }
+
+  // Off while something else takes the keyboard (the full-screen map): held keys are dropped and new presses ignored
+  setKeyboardEnabled(enabled) {
+    this._keyboardEnabled = Boolean(enabled);
+    if (!this._keyboardEnabled) this.clearKeyboardInput();
   }
 
   resetInput() {

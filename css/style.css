@@ -240,6 +240,32 @@ body::after {
   font-variant-numeric: tabular-nums;
 }
 
+/* A failed start-up (main.js): the progress gives way to what went wrong, selectable for a bug report */
+#loading-overlay.is-error .loader-track {
+  visibility: hidden;
+}
+
+#loading-overlay.is-error #loading-status,
+.loader-detail {
+  max-width: min(440px, calc(100vw - 32px));
+  line-height: 1.5;
+  text-wrap: balance;
+  user-select: text;
+}
+
+#loading-overlay.is-error #loading-status {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.loader-detail {
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
 @keyframes loader-sweep {
   from { transform: translateX(-100%); }
   to { transform: translateX(290%); }
@@ -1296,13 +1322,19 @@ body.is-boosting #hud-speed-meter {
   .map-controls { top: auto; bottom: calc(var(--edge) + 96px); translate: none; }
 }
 
+/* The 220 px radar, 194 px mode switch & 220 px cluster need 658 px side by side, 680 px with room between them: on
+   narrower screens the radar & gauge step aside, and the camera switcher & street signs stack above the mode switch */
+@media (max-width: 680px) {
+  .radar,
+  .gauge { display: none; }
+  .camera-switch { border-top: 0; }
+  .hud-bottom-right { bottom: calc(var(--edge) + 64px); }
+  .hud-bottom-left { bottom: calc(var(--edge) + 120px); }
+}
+
 @media (max-width: 620px) {
   .time-btn.active .seg-label { display: none; }
   .time-btn.active { padding: 0 9px; gap: 0; }
-  .radar { display: none; }
-  .hud-bottom-right { bottom: calc(var(--edge) + 64px); }
-  .gauge { display: none; }
-  .camera-switch { border-top: 0; }
 }
 
 /* Touch controls reserve the bottom corners; mode and camera selection remain within reach. */

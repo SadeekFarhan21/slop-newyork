@@ -151,6 +151,33 @@ for (const interruption of ['blur', 'hidden', 'reset']) {
   });
 }
 
+test('a disabled keyboard drops held controls and ignores presses until enabled again', () => {
+  const { controller, key } = keyboardHarness();
+  key('keydown', 'KeyW');
+  key('keydown', 'ShiftLeft');
+  controller.setTouchInput('left', 0.5);
+  controller.setKeyboardEnabled(false);
+  assert.equal(controller.keys.forward, false);
+  assert.equal(controller.keys.boost, false);
+  assert.equal(controller._pressedCodes.size, 0);
+  assert.equal(controller.keys.left, 0.5, 'only the keyboard is switched off');
+
+  // Arrow keys are a natural way to try panning the full-screen map: they must not drive the hidden vehicle.
+  for (const code of ['ArrowUp', 'KeyW', 'Space', 'KeyQ', 'ShiftRight']) key('keydown', code);
+  assert.equal(controller.keys.forward, false);
+  assert.equal(controller.keys.up, false);
+  assert.equal(controller.keys.down, false);
+  assert.equal(controller.keys.boost, false);
+  // Releases still count while disabled: the W held from before must not come back with the keyboard.
+  key('keyup', 'KeyW');
+  controller.setKeyboardEnabled(true);
+  assert.equal(controller.keys.forward, false);
+  key('keydown', 'KeyW');
+  assert.equal(controller.keys.forward, true);
+  key('keyup', 'KeyW');
+  assert.equal(controller.keys.forward, false);
+});
+
 test('Cmd and Ctrl shortcuts never move the player', () => {
   const { controller, key } = keyboardHarness();
   key('keydown', 'MetaLeft', 'BODY', { key: 'Meta', metaKey: true });
