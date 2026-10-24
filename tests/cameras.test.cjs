@@ -217,6 +217,36 @@ for (const preset of ['chase', 'observatory', 'drone']) {
   });
 }
 
+test('the 5th Ave preset frames the Empire State Building down the avenue, in landscape and portrait', async () => {
+  const { LANDMARK_SITES, avenueX, streetZ } = await import('../js/city-config.js');
+  const esb = LANDMARK_SITES['Empire State Building'];
+  const h = cameraHarness();
+  for (const elapsed of [0, 2 * Math.PI, 6 * Math.PI]) { // the sway at rest and at both ends
+    h.camera.setCameraPreset('fifthAve', true);
+    h.camera.update(1 / 60, elapsed);
+    const { position: eye, target, fov } = h.camera.camera;
+    assert.ok(Math.abs(eye.x - avenueX('5')) < 8 && Math.abs(eye.z - streetZ(42)) < 40, 'on 5th Ave at 42nd St');
+    assert.ok(eye.y > 1.5 && eye.y < 12 && target.z > eye.z + 500, 'at street level, looking south down the avenue');
+    // camera basis (three.js: right = forward x up), then normalized device coordinates
+    const f = [target.x - eye.x, target.y - eye.y, target.z - eye.z];
+    const fl = Math.hypot(...f);
+    f.forEach((v, i) => { f[i] = v / fl; });
+    const rl = Math.hypot(f[2], f[0]);
+    const r = [-f[2] / rl, 0, f[0] / rl];
+    const u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
+    const t = Math.tan((fov * Math.PI) / 360);
+    for (const aspect of [16 / 9, 9 / 16]) {
+      // the spire, the 86th-floor setbacks and the shaft above the lower setbacks
+      for (const [x, y, z] of [[esb.x, 443, esb.z], [esb.x - 12, 320, esb.z - 14], [esb.x + 12, 320, esb.z - 14], [esb.x - 22, 150, esb.z - 16], [esb.x + 22, 150, esb.z - 16]]) {
+        const v = [x - eye.x, y - eye.y, z - eye.z];
+        const dot = (a) => a[0] * v[0] + a[1] * v[1] + a[2] * v[2];
+        const ndc = [dot(r) / (dot(f) * t * aspect), dot(u) / (dot(f) * t)];
+        assert.ok(Math.abs(ndc[0]) < 0.95 && Math.abs(ndc[1]) < 0.95, `${y} m of the tower in frame at ${aspect.toFixed(2)}: ${ndc.map((n) => n.toFixed(2))}`);
+      }
+    }
+  }
+});
+
 test('teleport releases every camera pointer and ignores old gestures before accepting a new drag', () => {
   const h = cameraHarness();
   h.pointer(h.canvas, 'pointerdown', 1, 0);

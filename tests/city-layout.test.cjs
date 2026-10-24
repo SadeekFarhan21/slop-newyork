@@ -3,8 +3,10 @@ const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
+const { loadModule } = require('./helpers/module.cjs');
 
-// The city's layout at its real places: the Manhattan seawall & its esplanade, the pier decks and Little Island.
+// The city's layout at its real places: districts, the Manhattan seawall & its esplanade, Little Island and the
+// generated buildings (the United Nations, the East River lots, the view down 5th Ave to the Empire State Building).
 // Production code runs unchanged: city-config.js as a module, the rest as functions taken from their sources and run
 // against small stand-ins for Three.js.
 const read = (path) => readFileSync(join(__dirname, '..', path), 'utf8');
@@ -80,6 +82,33 @@ function edgeSamples(poly, out, step = 1) {
   }
   return pts;
 }
+
+// ---- Districts -----------------------------------------------------------------------------------------------------
+test('the East River waterfront from 23rd to 49th St is its own district, between Stuy Town and Beekman Place', () => {
+  const { blockAt, streetZ, avenueX, LANDMARK_SITES } = config;
+  const between = (a, b) => (streetZ(a) + streetZ(b)) / 2;
+  const east = avenueX('1') + 60; // east of 1st Ave
+  const un = LANDMARK_SITES['United Nations Secretariat Building'];
+  const district = (x, z) => blockAt(x, z) && blockAt(x, z).district;
+  assert.equal(district(un.x, un.z), 'riverfront', 'the United Nations headquarters');
+  assert.equal(district(east, between(39, 40)), 'riverfront', 'the old Con Ed site at 39th St');
+  assert.equal(district(east, between(31, 32)), 'riverfront', 'NYU Langone at 31st St');
+  assert.equal(district(east, between(24, 25)), 'riverfront', 'the VA Medical Center at 24th St');
+  assert.equal(district(avenueX('1') + 120, between(21, 22)), 'stuy_town', 'Peter Cooper Village');
+  assert.equal(district(avenueX('1') + 120, between(17, 18)), 'stuy_town', 'Stuyvesant Town');
+  assert.equal(district(east, between(50, 51)), 'turtle_bay', 'Beekman Place');
+  assert.equal(district(east, between(55, 56)), 'turtle_bay', 'Sutton Place');
+  assert.equal(district((avenueX('2') + avenueX('1')) / 2, between(40, 41)), 'turtle_bay', 'west of 1st Ave');
+});
+
+test('the Garment District reaches east to 5th Ave between 34th and 40th St', () => {
+  const { blockAt, streetZ, avenueX } = config;
+  const x = (avenueX('6') + avenueX('5')) / 2;
+  for (const n of [34, 35, 36, 37, 38, 39]) {
+    const b = blockAt(x, (streetZ(n) + streetZ(n + 1)) / 2);
+    assert.equal(b && b.district, 'garment', `5th to 6th Ave, ${n}th St`);
+  }
+});
 
 // ---- The seawall & its esplanade -----------------------------------------------------------------------------------
 let seawallCache;
@@ -339,4 +368,153 @@ test('Little Island\'s concrete skirt faces out from the park all round', () => 
     if (nx * mx + nz * mz > 0) outward++;
   }
   assert.equal(outward, p.length / 9, `${outward} of ${p.length / 9} skirt triangles face outward`);
+});
+
+// ---- Generated buildings -------------------------------------------------------------------------------------------
+let blocksCache;
+function cityBlocks() {
+  if (blocksCache) return blocksCache;
+  // Three.js, TSL and the GPU-side builders are stood in for by a no-op that answers everything
+  const stub = new Proxy(function () {}, {
+    get: (_t, key) => (key === Symbol.toPrimitive ? () => 0 : key === Symbol.iterator || key === 'then' ? undefined : stub),
+    set: () => true,
+    apply: () => stub,
+    construct: () => stub
+  });
+  const WALL_KINDS = vm.runInNewContext(`(${/const WALL_KINDS = (\{[^}]*\});/.exec(read('js/tsl-materials.js'))[1]})`);
+  const facades = [];
+  const { buildCityBlocks } = loadModule(read('js/buildings.js'), {
+    filename: 'buildings.js',
+    globals: { document: { createElement: () => ({ getContext: () => stub }) } },
+    imports: {
+      'three/webgpu': stub,
+      'three/tsl': stub,
+      'three/addons/utils/BufferGeometryUtils.js': { mergeGeometries: () => stub },
+      './fire-escapes.js': { createFireEscapes: () => stub },
+      './city-config.js': config,
+      './tsl-materials.js': {
+        createPreWarBuildingMaterial: (o) => ({ facade: 'masonry', ...o }),
+        createCurtainWallMaterial: (o) => ({ facade: 'curtain', ...o }),
+        createFacadeBoxes: (material, items) => { facades.push({ material, items }); return stub; },
+        createBillboardMaterial: () => stub,
+        WALL_KINDS
+      },
+      './nyc-geodata.js': { GEO },
+      './city-grid.js': {}
+    }
+  });
+  const built = buildCityBlocks(stub);
+  blocksCache = { ...built, facades, WALL_KINDS };
+  return blocksCache;
+}
+const top = (b) => b.y + b.h / 2;
+
+test('the United Nations Secretariat rises on its real footprint: a 154 m slab between marble end walls', () => {
+  const { facades, allBlocks, WALL_KINDS } = cityBlocks();
+  const S = config.LANDMARK_SITES['United Nations Secretariat Building'];
+  const near = (a, b, tol) => Math.abs(a - b) < tol;
+  const glass = facades.find((f) => f.material.facade === 'curtain' && f.material.glassTint === 0x1a3a52).items
+    .filter((b) => near(b.x, S.x, 1) && near(b.z, S.z, 1) && top(b) > 100);
+  assert.equal(glass.length, 1, 'one curtain-wall slab stands on the Secretariat\'s site');
+  const [slab] = glass;
+  assert.ok(near(slab.w, S.w, 0.5) && near(slab.d, S.d - 2.8, 0.5), `${slab.w} x ${slab.d} m on a ${S.w} x ${S.d} m site`);
+  assert.ok(slab.d > slab.w * 3.5, 'its long faces look west to the city and east over the river');
+  assert.ok(top(slab) > 150 && top(slab) < 156, `${top(slab)} m tall`);
+  assert.ok(slab.faces.every((k) => k === WALL_KINDS.entry), 'glazed all round');
+  const ends = facades.filter((f) => f.material.facade === 'masonry').flatMap((f) => f.items)
+    .filter((b) => near(b.x, S.x, 1) && near(Math.abs(b.z - S.z), S.d / 2 - 0.7, 0.5) && top(b) > 100);
+  assert.equal(ends.length, 2, 'marble walls close its north and south ends');
+  for (const e of ends) {
+    assert.ok(e.faces.every((k) => k === WALL_KINDS.blankStone), 'windowless');
+    assert.ok(near(e.w, slab.w + 0.6, 0.1) && near(top(e), top(slab), 2), 'as tall as the slab, proud of its glass');
+  }
+  // the superblock is one campus from 42nd to 48th St; around the slab only low buildings and the North Lawn
+  const campus = allBlocks.filter((b) => b.minX < S.x && b.maxX > S.x && b.minZ < S.z && b.maxZ > S.z);
+  assert.equal(campus.length, 1);
+  assert.ok(campus[0].minZ < config.streetZ(47) && campus[0].maxZ > config.streetZ(42) - 15, 'not cut into strips');
+  const low = campus[0].footprints.filter((f) => f.h < 100);
+  assert.ok(low.length >= 3 && low.every((f) => f.h < 40), 'the General Assembly, Conference Building and library stay low');
+  assert.ok(campus[0].yards.length > 0, 'the North Lawn');
+});
+
+test('the East River lots south of 42nd St are built up with hospital slabs and apartment towers', () => {
+  const { allBlocks } = cityBlocks();
+  const { streetZ } = config;
+  const lots = allBlocks.filter((b) => b.district === 'riverfront' && b.cz > streetZ(42) && b.cz < streetZ(23));
+  assert.ok(lots.length >= 10, `${lots.length} lots`);
+  const height = (b) => Math.max(0, ...b.footprints.map((f) => f.h));
+  assert.ok(lots.every((b) => b.footprints.length > 0), 'every lot is built on');
+  assert.ok(lots.every((b) => height(b) > 40 && height(b) < 200), 'mid- and high-rise, no supertalls');
+  const conEd = lots.filter((b) => b.cz < streetZ(34));
+  assert.ok(conEd.some((b) => height(b) > 100), 'towers on the old Con Ed sites');
+});
+
+test('the 5th Ave camera sees the Empire State Building rise over the street wall down the avenue', () => {
+  const { colliders } = cityBlocks();
+  const { streetZ, avenueX, LANDMARK_SITES } = config;
+  // the west side of 5th Ave from 34th to 40th St is mid-rise, as it really is
+  const west = colliders.filter((c) => c.minX > avenueX('6') + 10 && c.maxX < avenueX('5') - 10 && c.minZ > streetZ(40) && c.maxZ < streetZ(34));
+  assert.ok(west.length > 50);
+  const tallest = Math.max(...west.map((c) => c.maxY));
+  assert.ok(tallest < 70, `nothing between 5th & 6th Ave from 34th to 40th St towers over the lofts (${tallest.toFixed(1)} m)`);
+
+  // The 'fifthAve' preset's camera (cameras.js), at both ends of its sway
+  const events = () => ({ addEventListener() {} });
+  class Vector3 {
+    constructor(x = 0, y = 0, z = 0) { this.set(x, y, z); }
+    set(x, y, z) { this.x = x; this.y = y; this.z = z; return this; }
+    copy(v) { return this.set(v.x, v.y, v.z); }
+    add(v) { return this.set(this.x + v.x, this.y + v.y, this.z + v.z); }
+    sub(v) { return this.set(this.x - v.x, this.y - v.y, this.z - v.z); }
+    subVectors(a, b) { return this.copy(a).sub(b); }
+    lerp(v, t) { return this.set(this.x + (v.x - this.x) * t, this.y + (v.y - this.y) * t, this.z + (v.z - this.z) * t); }
+  }
+  class PerspectiveCamera {
+    constructor() { this.position = new Vector3(); }
+    updateProjectionMatrix() {}
+    lookAt() {}
+  }
+  const { CameraSystem } = loadModule(read('js/cameras.js'), {
+    globals: { window: { ...events(), innerWidth: 1600, innerHeight: 900 }, document: { ...events(), hidden: false } },
+    imports: { 'three/webgpu': { Vector3, PerspectiveCamera }, './landmarks.js': {} }
+  });
+  const entity = { position: new Vector3(), heading: 0, speed: 0, type: 'car', chaseDistance: 6.9, chaseHeight: 2.12, cameraTargetOffset: new Vector3(0, 1, 0) };
+  const cameras = new CameraSystem({ ...events(), style: {} }, { getActiveEntity: () => entity });
+  const eyes = [0, 2 * Math.PI, 6 * Math.PI].map((t) => {
+    cameras.setCameraPreset('fifthAve', true);
+    cameras.update(1 / 60, t);
+    return { ...cameras.camera.position };
+  });
+  assert.ok(eyes.every((e) => Math.abs(e.x - avenueX('5')) < 8 && Math.abs(e.z - streetZ(42)) < 40), 'on 5th Ave at 42nd St');
+
+  // Sight lines to the tower's north face from its 86th-floor setbacks to the spire stay clear of every building
+  const esb = LANDMARK_SITES['Empire State Building'];
+  const blocked = (eye, p) => colliders.some((c) => {
+    if (c.maxY < 20) return false;
+    let ox = eye.x, oz = eye.z, dx = p.x - eye.x, dz = p.z - eye.z;
+    let x0 = c.minX, x1 = c.maxX, z0 = c.minZ, z1 = c.maxZ;
+    if (c.obb) {
+      const { cx, cz, cs, sn, hx, hz } = c.obb;
+      [ox, oz] = [(ox - cx) * cs - (oz - cz) * sn, (ox - cx) * sn + (oz - cz) * cs];
+      [dx, dz] = [dx * cs - dz * sn, dx * sn + dz * cs];
+      [x0, x1, z0, z1] = [-hx, hx, -hz, hz];
+    }
+    let t0 = 0, t1 = 1;
+    for (const [o, d, a, b] of [[ox, dx, x0, x1], [oz, dz, z0, z1], [eye.y, p.y - eye.y, c.minY, c.maxY]]) {
+      if (Math.abs(d) < 1e-9) { if (o < a || o > b) return false; continue; }
+      const ta = (a - o) / d, tb = (b - o) / d;
+      t0 = Math.max(t0, Math.min(ta, tb));
+      t1 = Math.min(t1, Math.max(ta, tb));
+      if (t0 > t1) return false;
+    }
+    return true;
+  });
+  for (const eye of eyes) {
+    for (let y = 240; y <= 440; y += 25) {
+      for (const dx of [-12, 0, 12]) {
+        const p = { x: esb.x + dx * (y > 330 ? 0.2 : 1), y, z: esb.z - 14 };
+        assert.ok(!blocked(eye, p), `the Empire State at ${y} m is in view from ${eye.x.toFixed(1)}, ${eye.z.toFixed(1)}`);
+      }
+    }
+  }
 });
