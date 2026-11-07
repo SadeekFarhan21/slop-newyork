@@ -314,22 +314,32 @@ async function initApp() {
     cameraSystem.resetForTeleport();
     return true;
   }
-  // F on the platform: aboard the train standing alongside (the rider rides out of sight, the camera over the lead car);
-  // F aboard at a station: off onto its platform
+  // F on the platform: in through the nearest door of the train standing alongside; F aboard at a station: out onto its
+  // platform (or just walk through the open doors)
   function toggleRide() {
     const person = controllerManager.entities.person;
-    if (subway.riding) {
-      const out = subway.alight();
-      if (!out) return;
-      person.hidden = false;
-      controllerManager.placeActiveAt(out.x, out.y, out.z, out.heading);
-    } else if (subway.board(person.position.x, person.position.z)) {
-      person.hidden = true;
+    const to = subway.riding ? subway.alight() : subway.board(person.position.x, person.position.z);
+    if (to) controllerManager.placeActiveAt(to.x, to.y, to.z, to.heading);
+  }
+  // Walking into a street entrance's stairwell takes the player down into its station (not straight back down after
+  // coming up one)
+  let subwayCooldown = 0;
+  function walkedIntoEntrance(now) {
+    if (controllerManager.activeMode !== 'person' || subway.active || now < subwayCooldown) return false;
+    const p = controllerManager.entities?.person;
+    if (!p || Math.abs(p.speed) < 0.3) return false;
+    for (const e of streetDetails.subwayEntrances || []) {
+      const dx = p.position.x - e.x;
+      const dz = p.position.z - e.z;
+      if (Math.abs(dx) > 4 || Math.abs(dz) > 4) continue;
+      const c = Math.cos(e.theta), sn = Math.sin(e.theta);
+      if (Math.abs(dx * c - dz * sn) < e.halfW - 0.2 && Math.abs(dx * sn + dz * c) < e.halfL - 0.4) return true;
     }
+    return false;
   }
   function leaveSubway() {
     if (!subway.active) return;
-    controllerManager.entities.person.hidden = false;
+    subwayCooldown = performance.now() + 2500;
     const p = controllerManager.entities.person.position;
     const exit = subway.exitPoint(p.x, p.z);
     const node = subway.leave();
@@ -747,7 +757,14 @@ async function initApp() {
     // Trains first: a ridden one carries the pedestrian along before the controllers place them (see subway.js clamp)
     if (subway.active) {
       const rider = subway.update(dt);
-      if (rider) controllerManager.entities.person.heading = rider.heading;
+      if (rider) {
+        // carried along by the train; the player still walks about inside it
+        const person = controllerManager.entities.person;
+        person.rig.carry(rider.x - person.position.x, rider.z - person.position.z);
+        person.position.x = rider.x;
+        person.position.z = rider.z;
+        person.heading += rider.turn;
+      }
     }
     controllerManager.update(dt, elapsed);
     cameraSystem.update(dt, elapsed);
@@ -766,6 +783,7 @@ async function initApp() {
       nextPlayerSave = now + 5000;
     }
     if (boroughs.update) boroughs.update(elapsed); // Roosevelt Island Tramway cabins
+    if (walkedIntoEntrance(now)) selectMode('subway');
     if (subway.active && !subway.riding) {
       const p = controllerManager.entities.person.position;
       if (subway.reachedStreet(p.x, p.z)) selectMode('person'); // up the stairs and out

@@ -1139,6 +1139,21 @@ class PersonRig {
    * surface's height anywhere around. `air` lifts the body off the ground (jumps). Set `updatePose` false for hidden
    * pedestrians: their gait and planted feet still advance, while bone transforms wait until they are drawn.
    */
+  // Moved bodily with whatever the figure stands on (a subway car): the body and every foot's world-space points shift
+  // by (dx, dz), so the gait only sees the figure's own steps
+  carry(dx, dz) {
+    if (!this.placed) return;
+    this.x += dx;
+    this.z += dz;
+    for (const foot of this.feet) {
+      foot.px += dx;
+      foot.pz += dz;
+      if (foot.lx !== undefined) { foot.lx += dx; foot.lz += dz; }
+      if (foot.tx !== undefined) { foot.tx += dx; foot.tz += dz; }
+      if (foot.ax !== undefined) { foot.ax += dx; foot.az += dz; }
+    }
+  }
+
   update(dt, x, z, heading, ground, owner = null, air = 0, updatePose = true) {
     if (!this.placed || Math.hypot(x - this.x, z - this.z) > 3) {
       this.reset(x, z, heading, ground, owner);

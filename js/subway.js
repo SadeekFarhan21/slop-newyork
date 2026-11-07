@@ -34,7 +34,7 @@ const TRAIN_PERIOD = 64; // seconds between trains on each track
 const APPROACH = 13; // seconds braking in from the tunnel
 const DWELL = 20; // seconds standing at the platform
 const RIDE_HANDOFF = APPROACH + DWELL + 16; // a ridden train is deep in the dark tunnel: on to the next station
-const BOARD_REACH = 1.6; // from the platform edge
+const BOARD_REACH = 1.6; // from the platform edge (F boards from this close)
 
 const BULLET_TEXT = { 1: '#fff', 2: '#fff', 3: '#fff', 4: '#fff', 5: '#fff', 6: '#fff', 7: '#fff', N: '#000', Q: '#000', R: '#000', W: '#000' };
 
@@ -199,7 +199,12 @@ function materials() {
     carBody: std(0xb7bcc2, 0.32, 0.75),
     carRoof: std(0x8e9297, 0.5, 0.6),
     carUnder: std(0x1b1c1e, 0.8, 0.3),
+    carFloor: std(0x4a4744, 0.85),
+    carCeiling: std(0xb4b6b1, 0.7),
+    seat: std(0x51708f, 0.45),
+    pole: std(0xc9ccd0, 0.25, 0.9),
     lamp: new THREE.MeshBasicNodeMaterial({ color: 0xfff8e8 }),
+    carLamp: new THREE.MeshBasicNodeMaterial({ color: 0xc9ced2 }),
     window: new THREE.MeshBasicNodeMaterial({ color: 0xd9e6ea }),
     headlight: new THREE.MeshBasicNodeMaterial({ color: 0xfffbe6 }),
     daylight: new THREE.MeshBasicNodeMaterial({ color: 0xdce8f0 })
@@ -232,28 +237,89 @@ function instanced(group, mat, list, shadows = false) {
   return inst;
 }
 
-// A train of CARS stainless cars on one track, built along +z from its head at z = 0
+// Train frame: x across (the platform side is -x on either track, see trackToStation), z along, the head (the lead
+// car's face) at z = 0 and the cars behind it toward -z, y up from the rail tops. Cars are walk-in: floors level with
+// the platforms, open window bands, benches, poles, ceiling lights and three doors a side, whose leaves on the
+// platform side slide away while the train stands at a station.
+const CAR_GAP = 0.6;
+const CAR_BODY = CAR_LEN - CAR_GAP;
+const CAR_HALF_W = 1.5;
+const CAR_FLOOR = PLATFORM_H;
+const CAR_ROOF = CAR_FLOOR + 2.35;
+const DOORS = [-6.0, 0, 6.0]; // door centres from each car's centre
+const DOOR_W = 1.4;
+const AISLE = 0.8; // half-width walkable between the benches
+const carCentre = (c) => -c * CAR_LEN - CAR_LEN / 2;
+const TRAIN_DOORS = [];
+for (let c = 0; c < CARS; c++) for (const d of DOORS) TRAIN_DOORS.push(carCentre(c) + d);
+const atDoor = (tz) => TRAIN_DOORS.some((d) => Math.abs(tz - d) < DOOR_W / 2 - 0.15);
+const TRAIN_FRONT = -CAR_GAP / 2;
+const TRAIN_REAR = -CARS * CAR_LEN + CAR_GAP / 2;
+
 function buildTrain(line, ref) {
   const M = materials();
   const train = new THREE.Group();
-  const bodyY = 0.42 + 1.55; // over the rails
+  const parts = { carBody: [], carRoof: [], carUnder: [], carFloor: [], carCeiling: [], carLamp: [], seat: [], pole: [] };
+  const doorsShut = []; // platform-side leaves, hidden while the doors stand open
+  const wallX = CAR_HALF_W - 0.05;
   for (let c = 0; c < CARS; c++) {
-    const z0 = -c * CAR_LEN - CAR_LEN / 2;
-    box(train, M.carBody, 0, bodyY, z0, 3.02, 3.1, CAR_LEN - 0.9, false);
-    box(train, M.carRoof, 0, bodyY + 1.62, z0, 2.7, 0.18, CAR_LEN - 1.2, false);
-    box(train, M.carUnder, 0, 0.42, z0, 2.5, 0.55, CAR_LEN - 2.4, false);
-    // lit windows down both sides, broken by the doors
+    const zc = carCentre(c);
+    const z0 = zc - CAR_BODY / 2, z1 = zc + CAR_BODY / 2;
+    parts.carUnder.push([0, 0.6, zc, 2.6, 0.7, CAR_BODY - 1.6]);
+    parts.carFloor.push([0, CAR_FLOOR - 0.06, zc, CAR_HALF_W * 2, 0.12, CAR_BODY]);
+    parts.carRoof.push([0, CAR_ROOF + 0.09, zc, CAR_HALF_W * 2, 0.18, CAR_BODY]);
+    parts.carCeiling.push([0, CAR_ROOF - 0.02, zc, CAR_HALF_W * 2 - 0.2, 0.04, CAR_BODY - 0.2]);
+    for (const x of [-0.55, 0.55]) parts.carLamp.push([x, CAR_ROOF - 0.06, zc, 0.12, 0.03, CAR_BODY - 2]);
+    // the walls between the doors: solid below the windows, pillars across the open window band, solid above
+    const edges = [z0, ...DOORS.flatMap((d) => [zc + d - DOOR_W / 2, zc + d + DOOR_W / 2]), z1];
     for (const side of [-1, 1]) {
-      for (let w = 0; w < 4; w++) box(train, M.window, side * 1.515, bodyY + 0.42, z0 - CAR_LEN / 2 + 2.4 + w * 4.5, 0.02, 0.92, 2.4, false);
+      const x = side * wallX;
+      parts.carBody.push([x, CAR_ROOF - 0.25, zc, 0.1, 0.5, CAR_BODY]); // over the windows & doors
+      for (let k = 0; k < edges.length; k += 2) {
+        const a = edges[k], b = edges[k + 1], len = b - a, mid = (a + b) / 2;
+        parts.carBody.push([x, CAR_FLOOR + 0.43, mid, 0.1, 0.86, len]);
+        for (const pz of len > 3.6 ? [a + 0.12, mid, b - 0.12] : [a + 0.12, b - 0.12]) parts.carBody.push([x, CAR_FLOOR + 1.36, pz, 0.1, 1.0, 0.24]);
+        // a bench along the wall, its back against it
+        if (len > 1.4) {
+          parts.seat.push([side * (wallX - 0.3), CAR_FLOOR + 0.44, mid, 0.5, 0.08, len - 0.5]);
+          parts.seat.push([side * (wallX - 0.07), CAR_FLOOR + 0.78, mid, 0.06, 0.6, len - 0.5]);
+        }
+      }
+      for (const d of DOORS) {
+        for (const off of [-1, 1]) {
+          const leaf = [x, CAR_FLOOR + 1.0, zc + d + off * DOOR_W / 4, 0.07, 2.0, DOOR_W / 2];
+          if (side < 0) doorsShut.push(leaf);
+          else parts.carBody.push(leaf);
+          parts.pole.push([side * (wallX - 0.45), CAR_FLOOR + 1.17, zc + d + off * (DOOR_W / 2 + 0.25), 0.05, 2.34, 0.05]);
+        }
+      }
+    }
+    // car ends: a passage in the middle through to the next car; the train's front and back closed
+    for (const [ze, outer] of [[z1, c === 0], [z0, c === CARS - 1]]) {
+      if (outer) {
+        parts.carBody.push([0, (CAR_FLOOR + CAR_ROOF) / 2 - 0.3, ze, CAR_HALF_W * 2, CAR_ROOF - CAR_FLOOR + 1.6, 0.1]);
+        continue;
+      }
+      for (const sx of [-1, 1]) parts.carBody.push([sx * (0.45 + (CAR_HALF_W - 0.45) / 2), (CAR_FLOOR + CAR_ROOF) / 2, ze, CAR_HALF_W - 0.45, CAR_ROOF - CAR_FLOOR, 0.08]);
+      parts.carBody.push([0, CAR_ROOF - 0.2, ze, 0.9, 0.4, 0.08]);
     }
   }
-  // The lead car's face: headlights and the service bullet
+  for (const [name, list] of Object.entries(parts)) instanced(train, M[name], list, false);
+  const doors = instanced(train, M.carBody, doorsShut, false);
+  // lights in every other car (the cars' own glow besides the ceiling strips)
+  for (let c = 0; c < CARS; c += 2) {
+    const light = new THREE.PointLight(0xeef4ff, 5, 16, 1.4);
+    light.position.set(0, CAR_FLOOR + 1.4, carCentre(c) - CAR_LEN / 2);
+    train.add(light);
+  }
+  // The lead car's face: headlights, the cab window and the service bullet
+  const faceZ = TRAIN_FRONT + 0.06;
   const bullet = new THREE.Mesh(new THREE.PlaneGeometry(0.62, 0.62), new THREE.MeshBasicNodeMaterial({ map: bulletTexture(ref, line?.color || '#808183') }));
-  bullet.position.set(0.72, bodyY + 0.9, 0.02 - 0.45);
+  bullet.position.set(0.72, CAR_FLOOR + 1.9, faceZ + 0.01);
   train.add(bullet);
-  for (const side of [-1, 1]) box(train, M.headlight, side * 1.05, bodyY - 0.95, -0.44, 0.24, 0.16, 0.04, false);
-  box(train, M.window, -0.5, bodyY + 0.5, -0.43, 0.9, 0.9, 0.03, false); // the cab window
-  return train;
+  for (const side of [-1, 1]) box(train, M.headlight, side * 1.05, CAR_FLOOR - 0.2, faceZ, 0.24, 0.16, 0.04, false);
+  box(train, M.window, -0.5, CAR_FLOOR + 1.5, faceZ, 0.9, 0.9, 0.03, false);
+  return { group: train, doors };
 }
 
 // Where a train's head is at time t of its cycle along a track running +z: in from the tunnel, slowing to a stop with
@@ -357,7 +423,7 @@ function buildStation(station, rideRef = null, rideSide = 0) {
   }
   const lights = [];
   for (let z = -L / 2 + 12; z <= L / 2 - 12; z += 22) {
-    const light = new THREE.PointLight(0xfff3dc, 60, 24, 1.6);
+    const light = new THREE.PointLight(0xfff3dc, 38, 24, 1.6);
     light.position.set(0, ceilY - 0.5, z);
     group.add(light);
     lights.push(light);
@@ -389,13 +455,13 @@ function buildStation(station, rideRef = null, rideSide = 0) {
   const services = [...station.services].filter((r) => LINES.has(r));
   const trains = [-1, 1].map((side, i) => {
     const ref = side === rideSide && rideRef ? rideRef : services[i % Math.max(1, services.length)] || frame.line?.ref || 'S';
-    const t = buildTrain(LINES.get(ref), ref);
+    const { group: t, doors } = buildTrain(LINES.get(ref), ref);
     const pivot = new THREE.Group();
     pivot.position.set(side * TRACK_X, railY, 0);
-    pivot.rotation.y = side > 0 ? 0 : Math.PI; // the west train runs -z
+    pivot.rotation.y = side > 0 ? 0 : Math.PI; // the west train runs -z, so its -x (platform side) faces the platform too
     pivot.add(t);
     group.add(pivot);
-    return { pivot, train: t, ref, side, t: i * (TRAIN_PERIOD / 2) + 6 };
+    return { pivot, train: t, doors, ref, side, t: i * (TRAIN_PERIOD / 2) + 6 };
   });
 
   return { group, frame, heading, floorY, ceilY, railY, stairs, trains, lights, station };
@@ -437,6 +503,18 @@ function createSubwaySystem(scene) {
     return 0;
   }
 
+  // A train's frame (see buildTrain) <-> the station's: the west train's pivot is turned half round
+  const trainToStation = (tr, tx, tz) => ({ lx: tr.side * (TRACK_X + tx), lz: tr.side * (tz + trainHead(tr.t)) });
+  const stationToTrain = (tr, lx, lz) => ({ tx: lx * tr.side - TRACK_X, tz: lz * tr.side - trainHead(tr.t) });
+  const doorsOpen = (tr) => tr.t >= APPROACH + 1 && tr.t < APPROACH + DWELL - 1.5;
+  function boardAt(tr, tx, tz) {
+    const dir = tr.side; // the east train (+x) runs with the route
+    ride = { train: tr, ref: tr.ref, dir, next: nextStop(tr.ref, current.station, dir), tx, tz };
+    const { lx, lz } = trainToStation(tr, tx, tz);
+    const at = toWorld(lx, lz);
+    return { x: at.x, y: current.floorY, z: at.z, heading: current.heading + (tr.side > 0 ? Math.PI / 2 : -Math.PI / 2) };
+  }
+
   const system = {
     get active() { return !!current; },
     get station() { return current ? current.station : null; },
@@ -449,42 +527,36 @@ function createSubwaySystem(scene) {
       return `${ride.ref} train to ${ride.next ? ride.next.name : current.station.name}`;
     },
     get riding() { return !!ride; },
-    // The train at the platform beside the player (a world position on the platform), if one is standing there
-    boardable(x, z) {
+    // Aboard the train standing at the platform beside (x, z): stepped in through its nearest door. Returns where the
+    // player now stands (world x, y, z & heading), or null if no train stands there with its doors open.
+    board(x, z) {
       if (!current || ride) return null;
       const { lx, lz } = toLocal(x, z);
       for (const tr of current.trains) {
-        if (tr.t < APPROACH || tr.t >= APPROACH + DWELL - 1) continue;
-        if (Math.sign(lx) !== tr.side || Math.abs(lx) < PLATFORM_HALF_W - BOARD_REACH) continue;
-        const head = trainHead(tr.t);
-        const along = lz * tr.side; // distance along the train's direction of travel
-        if (along < head && along > head - CARS * CAR_LEN) return tr;
+        if (!doorsOpen(tr) || Math.sign(lx) !== tr.side || Math.abs(lx) < PLATFORM_HALF_W - BOARD_REACH) continue;
+        const { tz } = stationToTrain(tr, lx, lz);
+        if (tz > TRAIN_FRONT || tz < TRAIN_REAR) continue;
+        const door = TRAIN_DOORS.reduce((a, d) => (Math.abs(d - tz) < Math.abs(a - tz) ? d : a));
+        return boardAt(tr, 0, door);
       }
       return null;
     },
-    // Aboard the train standing beside the player; true if there was one
-    board(x, z) {
-      const tr = this.boardable(x, z);
-      if (!tr) return false;
-      const dir = tr.side; // the east train (+x) runs with the route
-      ride = { train: tr, ref: tr.ref, dir, next: nextStop(tr.ref, current.station, dir) };
-      return true;
-    },
-    // Off at the platform the train stands at: where the player steps out (world x, y, z & heading), or null between
-    // stations (the doors stay shut)
+    // Off onto the platform through the nearest door while the train stands at a station: where the player now
+    // stands, or null between stations (the doors stay shut)
     alight() {
-      if (!ride) return null;
+      if (!ride || !doorsOpen(ride.train)) return null;
       const tr = ride.train;
-      if (tr.t < APPROACH || tr.t >= APPROACH + DWELL) return null;
+      const door = TRAIN_DOORS.reduce((a, d) => (Math.abs(d - ride.tz) < Math.abs(a - ride.tz) ? d : a));
       ride = null;
-      const at = toWorld(tr.side * (PLATFORM_HALF_W - 0.9), tr.side * (trainHead(tr.t) - 6));
-      return { x: at.x, y: current.floorY, z: at.z, heading: current.heading + (tr.side > 0 ? 0 : Math.PI) };
+      const { lx, lz } = trainToStation(tr, -CAR_HALF_W - 1.7, door); // clear of the edge, where walking out boards
+      const at = toWorld(lx, lz);
+      return { x: at.x, y: current.floorY, z: at.z, heading: current.heading + (tr.side > 0 ? -Math.PI / 2 : Math.PI / 2) };
     },
-    // Where the rider is: over the lead car's roof, facing down the track (the camera follows from just behind)
+    // The rider's place in the world, from their place in the train
     riderPose() {
-      const tr = ride.train;
-      const at = toWorld(tr.side * TRACK_X, tr.side * (trainHead(tr.t) - 3));
-      return { x: at.x, y: current.railY + 2.9, z: at.z, heading: current.heading + (tr.side > 0 ? 0 : Math.PI) };
+      const { lx, lz } = trainToStation(ride.train, ride.tx, ride.tz);
+      const at = toWorld(lx, lz);
+      return { x: at.x, z: at.z };
     },
     nearestStation(x, z) {
       let best = null, bestD = Infinity;
@@ -542,19 +614,50 @@ function createSubwaySystem(scene) {
     },
     // The walking surface under (x, z) in the station: the platform, or a step of the stairs
     floorAt(x, z) {
-      if (ride) return this.riderPose().y;
+      if (ride) return current.floorY; // the cars' floors are level with the platforms
       const { lx, lz } = toLocal(x, z);
       return current.floorY + stairRise(lx, lz);
     },
     // Keep the pedestrian (radius r) on the platform: off the tracks, inside the end walls, off the columns
     clamp(pos, r) {
+      let alighted = false;
       if (ride) {
-        const p = this.riderPose();
-        pos.x = p.x;
-        pos.z = p.z;
-        return;
+        // Inside the train: along the aisle and through the cars, into the doorways, and out of an open one on the
+        // platform side onto the platform
+        const tr = ride.train;
+        const p = toLocal(pos.x, pos.z);
+        let { tx, tz } = stationToTrain(tr, p.lx, p.lz);
+        tz = Math.max(TRAIN_REAR + r, Math.min(TRAIN_FRONT - r, tz));
+        const door = atDoor(tz);
+        if (door && doorsOpen(tr) && tx < -CAR_HALF_W + 0.3) { // into an open doorway on the platform side: out
+          ride = null; // stepped out: the platform takes them from here (the clamp below sets them on its edge)
+          alighted = true;
+        } else {
+          const near = door ? CAR_HALF_W - 0.12 : AISLE;
+          tx = Math.max(-near + (door ? 0 : r), Math.min(near - (door ? 0 : r), tx));
+          ride.tx = tx;
+          ride.tz = tz;
+          const c = trainToStation(tr, tx, tz);
+          const w = toWorld(c.lx, c.lz);
+          pos.x = w.x;
+          pos.z = w.z;
+          return;
+        }
       }
       const { lx, lz } = toLocal(pos.x, pos.z);
+      // Walking off the platform edge through the open doors of a train standing there: aboard
+      if (!alighted && Math.abs(lx) > PLATFORM_HALF_W - r) {
+        for (const tr of current.trains) {
+          if (tr.side !== Math.sign(lx) || !doorsOpen(tr)) continue;
+          const { tz } = stationToTrain(tr, lx, lz);
+          if (tz > TRAIN_FRONT || tz < TRAIN_REAR || !atDoor(tz)) continue;
+          boardAt(tr, -CAR_HALF_W + 0.5, tz); // just inside, clear of the doorway (see the exit above)
+          const w = this.riderPose();
+          pos.x = w.x;
+          pos.z = w.z;
+          return;
+        }
+      }
       let x = Math.max(-PLATFORM_HALF_W + r, Math.min(PLATFORM_HALF_W - r, lx));
       let z = Math.max(-PLATFORM_LEN / 2 + 0.3 + r, Math.min(PLATFORM_LEN / 2 - 0.3 - r, lz));
       // the stairs' side rails: on a flight stay between them, beside it stay clear of it
@@ -575,6 +678,18 @@ function createSubwaySystem(scene) {
     },
     // Keep a camera inside the station: between the walls & the ends, under the ceiling, over the platform or rails
     clampCamera(pos) {
+      if (ride) {
+        // inside the car with the rider
+        const tr = ride.train;
+        const p = toLocal(pos.x, pos.z);
+        const { tx, tz } = stationToTrain(tr, p.lx, p.lz);
+        const c = trainToStation(tr, Math.max(-CAR_HALF_W + 0.25, Math.min(CAR_HALF_W - 0.25, tx)), Math.max(TRAIN_REAR + 0.3, Math.min(TRAIN_FRONT - 0.3, tz)));
+        const w = toWorld(c.lx, c.lz);
+        pos.x = w.x;
+        pos.z = w.z;
+        pos.y = Math.max(current.floorY + 0.5, Math.min(current.floorY + CAR_ROOF - CAR_FLOOR - 0.15, pos.y));
+        return;
+      }
       const { lx, lz } = toLocal(pos.x, pos.z);
       const x = Math.max(-HALL_HALF_W + 0.35, Math.min(HALL_HALF_W - 0.35, lx));
       const reach = ride ? PLATFORM_LEN / 2 + TUNNEL_LEN - 2 : PLATFORM_LEN / 2 + 30; // a rider's camera goes into the tunnels
@@ -594,8 +709,10 @@ function createSubwaySystem(scene) {
         tr.t += dt;
         if (tr.t >= TRAIN_PERIOD && tr !== ride?.train) tr.t -= TRAIN_PERIOD;
       }
+      let turn = 0;
       if (ride && ride.train.t >= RIDE_HANDOFF) {
-        let { ref, dir, next } = ride;
+        let { ref, dir, next, tx, tz } = ride;
+        const before = current.heading;
         if (!next) {
           dir = -dir;
           next = current.station;
@@ -606,10 +723,14 @@ function createSubwaySystem(scene) {
         scene.add(current.group);
         const tr = current.trains.find((t) => t.side === side);
         tr.t = 0;
-        ride = { train: tr, ref, dir, next: nextStop(ref, next, dir) };
+        ride = { train: tr, ref, dir, next: nextStop(ref, next, dir), tx, tz };
+        turn = current.heading - before; // the route turns between stations: the rider turns with the train
       }
-      for (const tr of current.trains) tr.train.position.z = trainHead(tr.t);
-      return ride ? this.riderPose() : null;
+      for (const tr of current.trains) {
+        tr.train.position.z = trainHead(tr.t);
+        tr.doors.visible = !doorsOpen(tr);
+      }
+      return ride ? { ...this.riderPose(), turn } : null;
     }
   };
   return system;

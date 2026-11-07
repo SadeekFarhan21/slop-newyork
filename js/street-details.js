@@ -987,7 +987,7 @@ function buildStreetDetails(scene) {
   };
   for (const [i, e] of placedEntrances.entries()) {
     // which end is open: alternate, so neighbouring stairs don't all face the same way
-    const open = i % 2 ? 1 : -1;
+    const open = (e.open = i % 2 ? 1 : -1);
     const hl = STAIR_LEN / 2;
     const hw = STAIR_W / 2;
     // Stair well (the dark opening) with the nosings of the first steps down catching the light
@@ -1487,7 +1487,9 @@ function buildStreetDetails(scene) {
   }
 
   scene.add(group);
-  return { group, footprints, signalClock, audioSignals, update };
+  // the subway's street entrances (subway.js / main.js): stair centre, turn (the stair's length along its local z)
+  const subwayEntrances = placedEntrances.map(({ x, z, theta }) => ({ x, z, theta, halfW: STAIR_W / 2, halfL: STAIR_LEN / 2 }));
+  return { group, footprints, signalClock, audioSignals, subwayEntrances, update };
 }
 
 export { buildStreetDetails, streetSignText, streetSignLength, cornerSignBlades, planStreetSignAtlas, drawStreetSignAtlas };
