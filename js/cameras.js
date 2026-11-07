@@ -32,6 +32,7 @@ class CameraSystem {
     );
 
     this.activePresetId = 'chase';
+    this.space = null; // an enclosed space the camera must stay inside: { clampCamera(position) }
     this.orbitYawOffset = 0.0;
     this.orbitPitchOffset = 0.09;
     this.zoomMultiplier = 1.0;
@@ -197,7 +198,7 @@ class CameraSystem {
 
         desiredPos.set(
           entity.position.x - Math.sin(totalYaw) * horizDist,
-          Math.max(0.65, entity.position.y + height),
+          Math.max(this.space ? -Infinity : 0.65, entity.position.y + height),
           entity.position.z - Math.cos(totalYaw) * horizDist
         );
 
@@ -217,7 +218,7 @@ class CameraSystem {
 
         desiredPos.set(
           entity.position.x - Math.sin(entity.heading) * backDist + Math.cos(entity.heading) * sideOffset,
-          Math.max(0.55, lowY),
+          Math.max(this.space ? -Infinity : 0.55, lowY),
           entity.position.z - Math.cos(entity.heading) * backDist - Math.sin(entity.heading) * sideOffset
         );
         desiredLook.set(
@@ -357,7 +358,7 @@ class CameraSystem {
       this.followLookOffset.lerp(desiredLook.sub(entity.position), k);
       this.currentPos.set(entity.position.x, this.followBaseY, entity.position.z).add(this.followOffset);
       this.currentLookAt.set(entity.position.x, this.followBaseY, entity.position.z).add(this.followLookOffset);
-      this.currentPos.y = Math.max(0.55, this.currentPos.y);
+      if (!this.space) this.currentPos.y = Math.max(0.55, this.currentPos.y);
     } else {
       this.followEntity = null;
       const k = 1 - Math.exp(-dt * 8.5);
@@ -365,6 +366,8 @@ class CameraSystem {
       this.currentLookAt.lerp(desiredLook, k);
     }
 
+    // Inside an enclosed space (a subway station, see subway.js) the camera stays between its walls
+    if (this.space) this.space.clampCamera(this.currentPos);
     this.camera.position.copy(this.currentPos);
     this.camera.lookAt(this.currentLookAt);
   }

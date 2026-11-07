@@ -202,6 +202,8 @@ class ThirdPersonControllerManager {
     this.colliders = colliders;
     this._colliderCells = null; // built on first use, see nearColliders()
     this.activeMode = 'car'; // 'person' | 'car' | 'cyclist' | 'helicopter'
+    // Down in the subway (subway.js) the pedestrian walks a station instead of the street: its floor & bounds
+    this.underground = null;
 
     this.keys = {
       forward: false,
@@ -395,6 +397,21 @@ class ThirdPersonControllerManager {
       ent.heading = heading;
       ent.position.y = this.arrivalHeight(destination.x, destination.z, altitude);
     }
+    this.settleActive(ent);
+    return { x: ent.position.x, z: ent.position.z };
+  }
+
+  // Put the active entity down at (x, y, z) as it stands, with no search for a clear spot (the subway's platforms)
+  placeActiveAt(x, y, z, heading) {
+    const ent = this.getActiveEntity();
+    this.resetInput();
+    ent.position.set(x, y, z);
+    ent.heading = heading;
+    this.settleActive(ent);
+  }
+
+  // At rest where it now is, the pedestrian's legs planted there
+  settleActive(ent) {
     this.stopEntity(ent);
     if (this.activeMode === 'person') {
       ent.verticalVel = 0;
@@ -405,7 +422,6 @@ class ThirdPersonControllerManager {
     }
     ent.mesh.position.copy(ent.position);
     ent.mesh.rotation.y = ent.heading;
-    return { x: ent.position.x, z: ent.position.z };
   }
 
   // Where the active entity arrives over (x, z): on the ground, or the helicopter at its altitude but never below its
@@ -883,6 +899,7 @@ class ThirdPersonControllerManager {
   }
 
   getGroundHeight(x, z, mode = 'person') {
+    if (mode === 'person' && this.underground) return this.underground.floorAt(x, z);
     // Inside Central Park (5th Ave to Central Park West, 59th St to 110th St)
     const cp = CENTRAL_PARK_BOUNDS;
     if (x > cp.minX && x < cp.maxX && z > cp.minZ && z < cp.maxZ) {
@@ -1120,7 +1137,8 @@ class ThirdPersonControllerManager {
 
     p.position.x += Math.sin(p.heading) * p.speed * dt;
     p.position.z += Math.cos(p.heading) * p.speed * dt;
-    this.resolveHorizontalCollision(p.position, 0.48);
+    if (this.underground) this.underground.clamp(p.position, 0.48);
+    else this.resolveHorizontalCollision(p.position, 0.48);
     this.updatePersonVertical(p, dt, this.keys.up);
   }
 

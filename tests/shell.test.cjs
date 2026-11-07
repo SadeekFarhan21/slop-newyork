@@ -291,6 +291,9 @@ async function startApp({ webgpu = true, webgl2 = true, initError = null, buildE
       }
     },
     './scene-culling.js': { setupSceneCulling() {}, updateSceneCulling() {} },
+    './subway.js': {
+      createSubwaySystem: () => ({ active: false, label: '', enter: () => null, leave: () => null, update() {}, reachedStreet: () => false })
+    },
     './audio-system.js': {
       CityAudioSystem: class {
         constructor(_simulation, { onStateChange }) {
