@@ -7,7 +7,7 @@
 //   dcp_boroughs.json      NYC DCP Borough Boundaries (water areas excluded)  data.cityofnewyork.us gthc-hcne
 //   cscl_manhattan.json    NYC street centerline (CSCL), Manhattan             data.cityofnewyork.us inkn-q76z
 //   nycparks_manhattan.json NYC Parks properties, Manhattan                    data.cityofnewyork.us enfh-gkve
-//   osm_*.json             OpenStreetMap via Overpass (Central Park features, piers, NJ coastline)
+//   osm_*.json             OpenStreetMap via Overpass (Central Park features, piers, NJ coastline, subway)
 //
 // usage: GEO_DATA=tools/data node tools/build-geodata.mjs [outFile]
 

@@ -20,7 +20,8 @@ const signs = loadModule(source, {
     './tsl-materials.js': {},
     './trees.js': {},
     './city-grid.js': {},
-    './landmarks.js': {}
+    './landmarks.js': {},
+    './nyc-geodata.js': geo
   },
   filename: 'street-details.js'
 });

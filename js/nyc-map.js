@@ -259,6 +259,20 @@ function mapLayers() {
     } else if (r.w >= 15) L.mainRoads.line(r.pts);
   }
 
+  // Subway services (one path each, in the MTA's trunk-line colours) and the stations
+  L.subway = (GEO.subway?.lines || []).map((line) => {
+    const path = new Path2D();
+    for (const pts of line.paths) {
+      for (let i = 0; i < pts.length; i += 3) (i ? path.lineTo : path.moveTo).call(path, pts[i], pts[i + 1]);
+    }
+    return { path, color: line.color };
+  });
+  L.subwayStations = new Path2D();
+  for (const [, x, z] of GEO.subway?.stations || []) {
+    L.subwayStations.moveTo(x + 9, z);
+    L.subwayStations.arc(x, z, 9, 0, Math.PI * 2);
+  }
+
   // Landmark lots
   L.landmarks = new Path2D();
   for (const name of MODELLED_LANDMARKS) {
@@ -864,6 +878,24 @@ class NYCMapSystem {
       ctx.strokeStyle = MAP.mainRoads;
       ctx.lineWidth = px(s < 0.05 ? 0.7 : 1.1);
       L.mainRoads.each(v, (p) => ctx.stroke(p));
+    }
+
+    // 7b. The subway on the atlas: services under the streets, stations once there is room for them
+    if (!isMinimap) {
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = Math.max(px(2.2), 5);
+      for (const line of L.subway) {
+        ctx.strokeStyle = line.color;
+        ctx.stroke(line.path);
+      }
+      ctx.globalAlpha = 1;
+      if (s > 0.06) {
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = MAP.halo;
+        ctx.lineWidth = px(1.2);
+        ctx.fill(L.subwayStations);
+        ctx.stroke(L.subwayStations);
+      }
     }
 
     // 8. Shore highways

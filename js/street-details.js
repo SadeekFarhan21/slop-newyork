@@ -20,6 +20,7 @@ import { cityUniforms, createSteamMaterial, createTreeGrateMaterial, createGodRa
 import { createTreeField } from './trees.js';
 import { pavedPlazaRects, centralParkClearings, parkTreeSites, sidewalkBlocks, parkLampSites } from './city-grid.js';
 import { bryantParkLawn } from './landmarks.js';
+import { GEO } from './nyc-geodata.js';
 
 // js/street-details.js
 // Populates Manhattan streets with authentic NYC street furniture using InstancedMesh:
@@ -893,24 +894,14 @@ function buildStreetDetails(scene) {
     metalness: 0.65
   });
   const subwayGlobeMat = new THREE.MeshBasicNodeMaterial({ color: 0x55ff88 });
-
-  const subwayLocations = [
-    [-16.5, 162],  // 34th St - Herald Sq / 5th Ave
-    [16.5, 162],
-    [-16.5, 16],   // 42nd St - Bryant Park / 5th Ave
-    [-126.5, 16],  // 42nd St - 6th Ave
-    [-203.5, -16], // Times Sq - 42nd St
-    [-236.5, -74], // Times Sq - 45th St
-    [126.5, -16],  // Grand Central - 42nd St
-    [203.5, -16],  // Lexington Ave / Chrysler
-    [203.5, -252], // 53rd St - Lex Ave (Citigroup)
-    [-16.5, -162], // 47th-50th Sts Rockefeller Ctr
-    [-16.5, 342]   // 23rd St - Flatiron
-  ];
+  const subwayWellMat = new THREE.MeshStandardNodeMaterial({ color: 0x101312, roughness: 0.9 });
+  const subwayStepMat = new THREE.MeshStandardNodeMaterial({ color: 0x8a8d88, roughness: 0.8 });
 
   const subwayRailMatrices = [];
   const subwayPostMatrices = [];
   const subwayGlobeMatrices = [];
+  const subwayWellMatrices = [];
+  const subwayStepMatrices = [];
 
   const snapToCurbIsland = (x, z, pad = 1.1) => {
     if (isOnCurbIsland(x, z, pad)) return { x, z };
@@ -925,34 +916,110 @@ function buildStreetDetails(scene) {
     return { x, z };
   };
 
-  for (const [oldX, oldZ] of subwayLocations) {
-    const raw = fromOldFrame(oldX, oldZ); // (authored on the former compressed grid)
-    const { x: subX, z: subZ } = snapToCurbIsland(raw.x, raw.z, 1.2);
-    // Iron railing enclosure around sidewalk stairs
-    dummy.position.set(subX, 0.8, subZ);
-    dummy.rotation.set(0, 0, 0);
-    dummy.scale.set(2.1, 1.15, 6.2);
-    dummy.updateMatrix();
-    subwayRailMatrices.push(dummy.matrix.clone());
-    addFootprint(subX, subZ, 2.1, 6.2);
-
-    // Twin MTA Green Globe Post Lamps at stair entrance
-    for (const ox of [-0.85, 0.85]) {
-      dummy.position.set(subX + ox, 1.9, subZ + 2.9);
-      dummy.scale.set(0.09, 1.4, 0.09);
-      dummy.updateMatrix();
-      subwayPostMatrices.push(dummy.matrix.clone());
-
-      dummy.position.set(subX + ox, 2.7, subZ + 2.9);
-      dummy.scale.set(0.26, 0.26, 0.26);
-      dummy.updateMatrix();
-      subwayGlobeMatrices.push(dummy.matrix.clone());
+  // Every street entrance in the data (OpenStreetMap), set on its sidewalk: from the mapped point, the nearest curb
+  // (the first step off the blocks in one of 16 directions) gives the sidewalk's outward normal; the stairs run along
+  // the curb with their centre STAIR_INSET in from it. Points mapped inside a building or plaza further than
+  // CURB_REACH from any curb keep their place, turned to the grid.
+  const STAIR_LEN = 6.0;
+  const STAIR_W = 2.0;
+  const STAIR_INSET = 2.4;
+  const CURB_REACH = 14;
+  const placedEntrances = [];
+  const entrances = GEO.subway?.entrances || [];
+  for (let i = 0; i < entrances.length; i += 2) {
+    let x = entrances[i];
+    let z = entrances[i + 1];
+    if (!blockAt(x, z)) {
+      // mapped on the roadway: onto the nearest block first
+      let found = false;
+      for (let r = 1; r <= 8 && !found; r++) {
+        for (let k = 0; k < 16; k++) {
+          const a = (k / 16) * Math.PI * 2;
+          if (blockAt(x + Math.cos(a) * r, z + Math.sin(a) * r)) {
+            x += Math.cos(a) * (r + 0.5);
+            z += Math.sin(a) * (r + 0.5);
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) continue;
     }
-    streetPointSites.push({ x: subX, y: 2.75, z: subZ + 2.9, color: 0x48ff80, intensity: 18, dist: 8.5 });
+    let curbDist = Infinity;
+    let nx = 0;
+    let nz = 1;
+    for (let k = 0; k < 16; k++) {
+      const a = (k / 16) * Math.PI * 2;
+      const ux = Math.cos(a);
+      const uz = Math.sin(a);
+      for (let r = 0.5; r < Math.min(curbDist, CURB_REACH); r += 0.5) {
+        if (!blockAt(x + ux * r, z + uz * r)) {
+          curbDist = r;
+          nx = ux;
+          nz = uz;
+          break;
+        }
+      }
+    }
+    let theta = 0;
+    if (curbDist < CURB_REACH) {
+      // snap the normal to the grid when it is within a step of an axis (the grid's curbs are axis-aligned)
+      if (Math.abs(nx) > 0.92) { nx = Math.sign(nx); nz = 0; }
+      else if (Math.abs(nz) > 0.92) { nz = Math.sign(nz); nx = 0; }
+      x += nx * (curbDist - STAIR_INSET);
+      z += nz * (curbDist - STAIR_INSET);
+      theta = Math.atan2(nx, nz) + Math.PI / 2; // the stair's long side along the curb
+    }
+    if (!isOnCurbIsland(x, z, 1.1)) continue;
+    // one entrance per stair (OSM maps some twice) and never one on top of another
+    if (placedEntrances.some((e) => Math.hypot(e.x - x, e.z - z) < STAIR_LEN)) continue;
+    placedEntrances.push({ x, z, theta });
   }
+
+  const local = new THREE.Vector3();
+  const place = (e, lx, ly, lz, sx, sy, sz) => {
+    local.set(lx, ly, lz).applyAxisAngle(THREE.Object3D.DEFAULT_UP, e.theta);
+    dummy.position.set(e.x + local.x, ly, e.z + local.z);
+    dummy.rotation.set(0, e.theta, 0);
+    dummy.scale.set(sx, sy, sz);
+    dummy.updateMatrix();
+    return dummy.matrix.clone();
+  };
+  for (const [i, e] of placedEntrances.entries()) {
+    // which end is open: alternate, so neighbouring stairs don't all face the same way
+    const open = i % 2 ? 1 : -1;
+    const hl = STAIR_LEN / 2;
+    const hw = STAIR_W / 2;
+    // Stair well (the dark opening) with the nosings of the first steps down catching the light
+    subwayWellMatrices.push(place(e, 0, 0.03, 0, STAIR_W - 0.1, 0.04, STAIR_LEN - 0.1));
+    for (let s = 0; s < 6; s++) {
+      subwayStepMatrices.push(place(e, 0, 0.052, open * (hl - 0.35 - s * 0.42), STAIR_W - 0.2, 0.012, 0.07));
+    }
+    // Iron railings: both long sides & the closed end, with a top rail
+    for (const side of [-1, 1]) {
+      subwayRailMatrices.push(place(e, side * hw, 0.55, 0, 0.06, 1.1, STAIR_LEN));
+      subwayRailMatrices.push(place(e, side * hw, 1.12, 0, 0.1, 0.06, STAIR_LEN + 0.06));
+    }
+    subwayRailMatrices.push(place(e, 0, 0.55, -open * hl, STAIR_W, 1.1, 0.06));
+    subwayRailMatrices.push(place(e, 0, 1.12, -open * hl, STAIR_W + 0.06, 0.06, 0.1));
+    // Twin green globe lamps on posts at the open end
+    for (const side of [-1, 1]) {
+      subwayPostMatrices.push(place(e, side * hw, 1.2, open * hl, 0.07, 2.4, 0.07));
+      subwayGlobeMatrices.push(place(e, side * hw, 2.6, open * hl, 0.22, 0.22, 0.22));
+    }
+    // the stair's world bounds as a footprint (stairs off the grid's axes get their bounding box)
+    const c = Math.abs(Math.cos(e.theta));
+    const sn = Math.abs(Math.sin(e.theta));
+    addFootprint(e.x, e.z, (STAIR_W + 0.3) * c + (STAIR_LEN + 0.3) * sn, (STAIR_W + 0.3) * sn + (STAIR_LEN + 0.3) * c);
+    local.set(0, 0, open * hl).applyAxisAngle(THREE.Object3D.DEFAULT_UP, e.theta);
+    streetPointSites.push({ x: e.x + local.x, y: 2.65, z: e.z + local.z, color: 0x48ff80, intensity: 14, dist: 8.5 });
+  }
+  addMatrixArrayInstanced(unitBox, subwayWellMat, subwayWellMatrices, false);
+  addMatrixArrayInstanced(unitBox, subwayStepMat, subwayStepMatrices, false);
   addMatrixArrayInstanced(unitBox, subwayRailingMat, subwayRailMatrices);
   addMatrixArrayInstanced(unitCyl, subwayRailingMat, subwayPostMatrices);
   addMatrixArrayInstanced(new THREE.SphereGeometry(1, 10, 10), subwayGlobeMat, subwayGlobeMatrices, false);
+  console.info(`[streetDetails] ${placedEntrances.length} subway entrances (of ${entrances.length / 2} mapped)`);
 
   // =========================================================================
   // 5. NYC HOT DOG / HALAL FOOD CARTS WITH UMBRELLAS & SIDEWALK PROPS
