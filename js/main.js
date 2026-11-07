@@ -268,7 +268,7 @@ async function initApp() {
     car: [[['W', 'S'], 'Drive / Reverse'], [['A', 'D'], 'Steer'], [['Shift'], 'Boost'], [['B'], 'Horn'], [['Drag'], 'Orbit']],
     cyclist: [[['W', 'S'], 'Pedal / Brake'], [['A', 'D'], 'Lean & Turn'], [['Shift'], 'Sprint'], [['Drag'], 'Orbit']],
     helicopter: [[['W', 'S'], 'Pitch'], [['A', 'D'], 'Yaw'], [['Space', 'E'], 'Ascend'], [['Q', 'C'], 'Descend'], [['Shift'], 'Boost']],
-    subway: [[['W', 'S'], 'Walk'], [['A', 'D'], 'Turn'], [['Shift'], 'Sprint'], [['Stairs'], 'Street'], [['5'], 'Exit']]
+    subway: [[['W', 'S'], 'Walk'], [['Shift'], 'Run'], [['F'], 'Board / Get off'], [['Stairs'], 'Street'], [['5'], 'Exit']]
   };
   // Boosted top speeds in mph (controllers.js caps them at 8.2, 36, 19 & 52 m/s): full scale of the speed meter
   const topSpeedMph = { person: 18, car: 81, cyclist: 43, helicopter: 116 };
@@ -314,8 +314,22 @@ async function initApp() {
     cameraSystem.resetForTeleport();
     return true;
   }
+  // F on the platform: aboard the train standing alongside (the rider rides out of sight, the camera over the lead car);
+  // F aboard at a station: off onto its platform
+  function toggleRide() {
+    const person = controllerManager.entities.person;
+    if (subway.riding) {
+      const out = subway.alight();
+      if (!out) return;
+      person.hidden = false;
+      controllerManager.placeActiveAt(out.x, out.y, out.z, out.heading);
+    } else if (subway.board(person.position.x, person.position.z)) {
+      person.hidden = true;
+    }
+  }
   function leaveSubway() {
     if (!subway.active) return;
+    controllerManager.entities.person.hidden = false;
     const p = controllerManager.entities.person.position;
     const exit = subway.exitPoint(p.x, p.z);
     const node = subway.leave();
@@ -574,6 +588,9 @@ async function initApp() {
       case 'Digit5':
         selectMode(subway.active ? 'person' : 'subway');
         break;
+      case 'KeyF':
+        if (subway.active) toggleRide();
+        break;
       case 'Digit6':
         selectCamera('action', true);
         break;
@@ -727,6 +744,11 @@ async function initApp() {
 
     // Update 3rd-person controllers, camera, signals, traffic & vehicle collisions, building LODs, and dynamic shadow focus
     gamepadControls.update(dt);
+    // Trains first: a ridden one carries the pedestrian along before the controllers place them (see subway.js clamp)
+    if (subway.active) {
+      const rider = subway.update(dt);
+      if (rider) controllerManager.entities.person.heading = rider.heading;
+    }
     controllerManager.update(dt, elapsed);
     cameraSystem.update(dt, elapsed);
     streetDetails.signalClock.value = elapsed;
@@ -744,8 +766,7 @@ async function initApp() {
       nextPlayerSave = now + 5000;
     }
     if (boroughs.update) boroughs.update(elapsed); // Roosevelt Island Tramway cabins
-    if (subway.active) {
-      subway.update(dt, elapsed);
+    if (subway.active && !subway.riding) {
       const p = controllerManager.entities.person.position;
       if (subway.reachedStreet(p.x, p.z)) selectMode('person'); // up the stairs and out
     }

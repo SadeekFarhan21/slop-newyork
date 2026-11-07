@@ -31,15 +31,19 @@ const STAIR_EXIT_RISE = 2.0; // climbing this high up a flight takes the player 
 const CAR_LEN = 18.3; // a 60 ft car
 const CARS = 8;
 const TRAIN_PERIOD = 64; // seconds between trains on each track
-const DWELL = 20;
+const APPROACH = 13; // seconds braking in from the tunnel
+const DWELL = 20; // seconds standing at the platform
+const RIDE_HANDOFF = APPROACH + DWELL + 16; // a ridden train is deep in the dark tunnel: on to the next station
+const BOARD_REACH = 1.6; // from the platform edge
 
 const BULLET_TEXT = { 1: '#fff', 2: '#fff', 3: '#fff', 4: '#fff', 5: '#fff', 6: '#fff', 7: '#fff', N: '#000', Q: '#000', R: '#000', W: '#000' };
 
 // Where along a service's route a station lies: the nearest point of the route to the station's node, with the
 // route's direction there and its track height (below 0 in tunnel)
-function routeFrame(station) {
+function routeFrame(station, preferRef = null) {
   let best = null;
-  for (const ref of station.services) {
+  const refs = preferRef ? [preferRef] : [...station.services];
+  for (const ref of refs) {
     const line = LINES.get(ref);
     if (!line) continue;
     for (const pts of line.paths) {
@@ -60,6 +64,39 @@ function routeFrame(station) {
     if (best && best.d < 60) break; // the station's first service runs right under it
   }
   if (!best || best.d > 120) return { x: station.x, z: station.z, dirX: 0, dirZ: -1, trackY: -9, line: LINES.get(station.services[0]) };
+  return best;
+}
+
+// How far along a service's route (x, z) lies, in metres from its start (each piece of the route continues the count)
+function routeDistance(line, x, z) {
+  let best = Infinity, bestS = 0, base = 0;
+  for (const pts of line.paths) {
+    let acc = 0;
+    for (let i = 0; i + 5 < pts.length; i += 3) {
+      const ax = pts[i], az = pts[i + 1], dx = pts[i + 3] - ax, dz = pts[i + 4] - az;
+      const len = Math.hypot(dx, dz);
+      if (len < 1e-6) continue;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (len * len)));
+      const d = Math.hypot(ax + dx * t - x, az + dz * t - z);
+      if (d < best) { best = d; bestS = base + acc + t * len; }
+      acc += len;
+    }
+    base += acc + 1e5;
+  }
+  return bestS;
+}
+// The stop after `station` for service `ref`, running with the route (dir 1) or against it (-1); null at the end of
+// the line in Manhattan. A station complex mapped as several nodes counts once.
+function nextStop(ref, station, dir) {
+  const line = LINES.get(ref);
+  if (!line) return null;
+  const here = routeDistance(line, station.x, station.z);
+  let best = null, bestGap = Infinity;
+  for (const s of STATIONS) {
+    if (!s.services.includes(ref)) continue;
+    const gap = (routeDistance(line, s.x, s.z) - here) * dir;
+    if (gap > 120 && gap < bestGap) { bestGap = gap; best = s; }
+  }
   return best;
 }
 
@@ -223,7 +260,7 @@ function buildTrain(line, ref) {
 // its head near the platform's far end, waiting with its doors to the platform, then out into the tunnel ahead
 function trainHead(t) {
   const stop = PLATFORM_LEN / 2 - 6;
-  const approach = 13; // seconds to brake from tunnel speed
+  const approach = APPROACH;
   const reach = stop + PLATFORM_LEN / 2 + 12; // braking from a head 12 m inside the tunnel: all of it out of sight
   if (t < approach) {
     const u = 1 - t / approach;
@@ -234,9 +271,10 @@ function trainHead(t) {
   return stop + 0.9 * s * s; // the tail clears the platform ~13 s out, well inside the cycle
 }
 
-function buildStation(station) {
+// The station, with the train on track `rideSide` (-1 west, 1 east) running `rideRef` when the player arrives on it
+function buildStation(station, rideRef = null, rideSide = 0) {
   const M = materials();
-  const frame = routeFrame(station);
+  const frame = routeFrame(station, rideRef);
   const railY = Math.min(frame.trackY, -9);
   const floorY = railY + PLATFORM_H;
   const ceilY = floorY + CEILING;
@@ -303,6 +341,10 @@ function buildStation(station) {
   instanced(group, M.column, columns, true);
   const lamps = [];
   for (const x of [-2.2, 2.2, -TRACK_X, TRACK_X]) for (let z = -L / 2 + 3; z <= L / 2 - 3; z += 6) lamps.push([x, ceilY - 0.06, z, 0.16, 0.06, 3.2]);
+  // dim work lights along the tunnel walls, so a ride through the dark shows its speed
+  for (const side of [-1, 1]) {
+    for (const end of [-1, 1]) for (let d = 12; d < TUNNEL_LEN; d += 18) lamps.push([side * (HALL_HALF_W - 0.05), railY + 2.6, end * (L / 2 + d), 0.08, 0.14, 0.5]);
+  }
   instanced(group, M.lamp, lamps);
   const signMat = new THREE.MeshBasicNodeMaterial({ map: nameSignTexture(station) });
   for (let z = -L / 2 + 20; z < L / 2 - 15; z += 30) {
@@ -346,21 +388,36 @@ function buildStation(station) {
   // Trains: one on each track, the east one (+x) running along the route's direction, the west one against it
   const services = [...station.services].filter((r) => LINES.has(r));
   const trains = [-1, 1].map((side, i) => {
-    const ref = services[i % Math.max(1, services.length)] || frame.line?.ref || 'S';
+    const ref = side === rideSide && rideRef ? rideRef : services[i % Math.max(1, services.length)] || frame.line?.ref || 'S';
     const t = buildTrain(LINES.get(ref), ref);
     const pivot = new THREE.Group();
     pivot.position.set(side * TRACK_X, railY, 0);
     pivot.rotation.y = side > 0 ? 0 : Math.PI; // the west train runs -z
     pivot.add(t);
     group.add(pivot);
-    return { pivot, train: t, ref, phase: i * (TRAIN_PERIOD / 2) + 6 };
+    return { pivot, train: t, ref, side, t: i * (TRAIN_PERIOD / 2) + 6 };
   });
 
   return { group, frame, heading, floorY, ceilY, railY, stairs, trains, lights, station };
 }
 
+function disposeStation(st) {
+  st.group.removeFromParent();
+  const shared = new Set(Object.values(materials()));
+  st.group.traverse((o) => {
+    if (o.isInstancedMesh) o.dispose();
+    else if (o.isMesh && o.geometry !== unitBox) o.geometry.dispose();
+    if (o.isMesh && !shared.has(o.material)) {
+      o.material.map?.dispose();
+      o.material.dispose();
+    }
+  });
+}
+
 function createSubwaySystem(scene) {
   let current = null;
+  // On a train: which one, the service, its direction along the route (1 with it: the east track) and where it calls next
+  let ride = null;
   const cos = () => Math.cos(current.heading);
   const sin = () => Math.sin(current.heading);
   // world <-> station frame (the group's rotation about y)
@@ -384,7 +441,50 @@ function createSubwaySystem(scene) {
     get active() { return !!current; },
     get station() { return current ? current.station : null; },
     get label() {
-      return current ? current.station.name : '';
+      if (!current) return '';
+      if (!ride) return current.station.name;
+      const t = ride.train.t;
+      if (t < APPROACH) return `${ride.ref} train arriving at ${current.station.name}`;
+      if (t < APPROACH + DWELL) return `${ride.ref} train at ${current.station.name}`;
+      return `${ride.ref} train to ${ride.next ? ride.next.name : current.station.name}`;
+    },
+    get riding() { return !!ride; },
+    // The train at the platform beside the player (a world position on the platform), if one is standing there
+    boardable(x, z) {
+      if (!current || ride) return null;
+      const { lx, lz } = toLocal(x, z);
+      for (const tr of current.trains) {
+        if (tr.t < APPROACH || tr.t >= APPROACH + DWELL - 1) continue;
+        if (Math.sign(lx) !== tr.side || Math.abs(lx) < PLATFORM_HALF_W - BOARD_REACH) continue;
+        const head = trainHead(tr.t);
+        const along = lz * tr.side; // distance along the train's direction of travel
+        if (along < head && along > head - CARS * CAR_LEN) return tr;
+      }
+      return null;
+    },
+    // Aboard the train standing beside the player; true if there was one
+    board(x, z) {
+      const tr = this.boardable(x, z);
+      if (!tr) return false;
+      const dir = tr.side; // the east train (+x) runs with the route
+      ride = { train: tr, ref: tr.ref, dir, next: nextStop(tr.ref, current.station, dir) };
+      return true;
+    },
+    // Off at the platform the train stands at: where the player steps out (world x, y, z & heading), or null between
+    // stations (the doors stay shut)
+    alight() {
+      if (!ride) return null;
+      const tr = ride.train;
+      if (tr.t < APPROACH || tr.t >= APPROACH + DWELL) return null;
+      ride = null;
+      const at = toWorld(tr.side * (PLATFORM_HALF_W - 0.9), tr.side * (trainHead(tr.t) - 6));
+      return { x: at.x, y: current.floorY, z: at.z, heading: current.heading + (tr.side > 0 ? 0 : Math.PI) };
+    },
+    // Where the rider is: over the lead car's roof, facing down the track (the camera follows from just behind)
+    riderPose() {
+      const tr = ride.train;
+      const at = toWorld(tr.side * TRACK_X, tr.side * (trainHead(tr.t) - 3));
+      return { x: at.x, y: current.railY + 2.9, z: at.z, heading: current.heading + (tr.side > 0 ? 0 : Math.PI) };
     },
     nearestStation(x, z) {
       let best = null, bestD = Infinity;
@@ -411,17 +511,9 @@ function createSubwaySystem(scene) {
     leave() {
       if (!current) return null;
       const out = { x: current.station.x, z: current.station.z };
-      current.group.removeFromParent();
-      const shared = new Set(Object.values(materials()));
-      current.group.traverse((o) => {
-        if (o.isInstancedMesh) o.dispose();
-        else if (o.isMesh && o.geometry !== unitBox) o.geometry.dispose();
-        if (o.isMesh && !shared.has(o.material)) {
-          o.material.map?.dispose();
-          o.material.dispose();
-        }
-      });
+      disposeStation(current);
       current = null;
+      ride = null;
       return out;
     },
     // Where the player comes out: beside the real entrance nearest to (x, z), on the curb side of its sidewalk (the
@@ -450,11 +542,18 @@ function createSubwaySystem(scene) {
     },
     // The walking surface under (x, z) in the station: the platform, or a step of the stairs
     floorAt(x, z) {
+      if (ride) return this.riderPose().y;
       const { lx, lz } = toLocal(x, z);
       return current.floorY + stairRise(lx, lz);
     },
     // Keep the pedestrian (radius r) on the platform: off the tracks, inside the end walls, off the columns
     clamp(pos, r) {
+      if (ride) {
+        const p = this.riderPose();
+        pos.x = p.x;
+        pos.z = p.z;
+        return;
+      }
       const { lx, lz } = toLocal(pos.x, pos.z);
       let x = Math.max(-PLATFORM_HALF_W + r, Math.min(PLATFORM_HALF_W - r, lx));
       let z = Math.max(-PLATFORM_LEN / 2 + 0.3 + r, Math.min(PLATFORM_LEN / 2 - 0.3 - r, lz));
@@ -478,22 +577,42 @@ function createSubwaySystem(scene) {
     clampCamera(pos) {
       const { lx, lz } = toLocal(pos.x, pos.z);
       const x = Math.max(-HALL_HALF_W + 0.35, Math.min(HALL_HALF_W - 0.35, lx));
-      const z = Math.max(-PLATFORM_LEN / 2 - 30, Math.min(PLATFORM_LEN / 2 + 30, lz));
+      const reach = ride ? PLATFORM_LEN / 2 + TUNNEL_LEN - 2 : PLATFORM_LEN / 2 + 30; // a rider's camera goes into the tunnels
+      const z = Math.max(-reach, Math.min(reach, lz));
       const overPlatform = Math.abs(x) < PLATFORM_HALF_W && Math.abs(z) < PLATFORM_LEN / 2;
       const w = toWorld(x, z);
       pos.x = w.x;
       pos.z = w.z;
       pos.y = Math.max((overPlatform ? current.floorY : current.railY) + 0.4, Math.min(current.ceilY - 0.3, pos.y));
     },
-    update(dt, elapsed) {
-      if (!current) return;
+    // The trains run their timetables; the one the player rides carries them on: deep in the tunnel past a station it
+    // pulls into the next one on its service (built in place of this one, the train coming in from its tunnel). At the
+    // end of the line in Manhattan it turns back. Returns the rider's pose while riding.
+    update(dt) {
+      if (!current) return null;
       for (const tr of current.trains) {
-        const t = (elapsed + tr.phase) % TRAIN_PERIOD;
-        tr.train.position.z = trainHead(t);
+        tr.t += dt;
+        if (tr.t >= TRAIN_PERIOD && tr !== ride?.train) tr.t -= TRAIN_PERIOD;
       }
+      if (ride && ride.train.t >= RIDE_HANDOFF) {
+        let { ref, dir, next } = ride;
+        if (!next) {
+          dir = -dir;
+          next = current.station;
+        }
+        const side = dir; // with the route: the east track
+        disposeStation(current);
+        current = buildStation(next, ref, side);
+        scene.add(current.group);
+        const tr = current.trains.find((t) => t.side === side);
+        tr.t = 0;
+        ride = { train: tr, ref, dir, next: nextStop(ref, next, dir) };
+      }
+      for (const tr of current.trains) tr.train.position.z = trainHead(tr.t);
+      return ride ? this.riderPose() : null;
     }
   };
   return system;
 }
 
-export { createSubwaySystem, routeFrame, trainHead, STATIONS, PLATFORM_LEN, TRAIN_PERIOD };
+export { createSubwaySystem, routeFrame, routeDistance, nextStop, trainHead, STATIONS, PLATFORM_LEN, TRAIN_PERIOD };

@@ -1064,7 +1064,7 @@ class ThirdPersonControllerManager {
     const air = p.position.y - this.getGroundHeight(p.position.x, p.position.z, 'person');
     p.rig.update(dt, p.position.x, p.position.z, p.heading, personGround, this, air > 0.02 ? air : 0);
     p.crowd.begin();
-    p.crowd.add(p.rig, 0);
+    if (!p.hidden) p.crowd.add(p.rig, 0); // out of sight aboard a subway train
     p.crowd.end();
 
     const b = this.entities.cyclist;
