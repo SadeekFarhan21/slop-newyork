@@ -4,7 +4,7 @@
 
 :root {
   /* Surfaces */
-  --glass: rgba(18, 19, 22, 0.62);
+  --glass: rgba(18, 19, 22, 0.84);
   --glass-strong: rgba(16, 17, 20, 0.88);
   --glass-border: rgba(255, 255, 255, 0.09);
   --glass-highlight: rgba(255, 255, 255, 0.08);
@@ -15,7 +15,7 @@
   /* Text */
   --text: #f6f5f2;
   --text-2: rgba(246, 245, 242, 0.68);
-  --text-3: rgba(246, 245, 242, 0.44);
+  --text-3: rgba(246, 245, 242, 0.5); /* at least 4.5:1 on the glass panels (WCAG AA) */
 
   /* Accents */
   --taxi: #ffc21a;
@@ -155,10 +155,10 @@ body::after {
 /* ------------------------------------------------------------------------------------------------------------------
    Glass panel
    ------------------------------------------------------------------------------------------------------------------ */
+/* No backdrop blur: re-blurring the 3D view under every panel each frame cost ~15% of the frame rate. The fill is
+   opaque enough to read over a bright sky on its own. */
 .panel {
   background: var(--grain), var(--glass);
-  -webkit-backdrop-filter: blur(22px) saturate(170%);
-  backdrop-filter: blur(22px) saturate(170%);
   border: 1px solid var(--glass-border);
   border-radius: var(--r-panel);
   box-shadow: inset 0 1px 0 var(--glass-highlight), var(--shadow);
@@ -209,7 +209,7 @@ body::after {
   position: relative;
   width: 240px;
   height: 3px;
-  margin: 26px 0 14px;
+  margin-top: 26px;
   border-radius: 3px;
   background: rgba(255, 255, 255, 0.1);
   overflow: hidden;
@@ -229,9 +229,12 @@ body::after {
 }
 
 #loading-status {
-  font-size: 12.5px;
-  color: var(--text-3);
-  font-variant-numeric: tabular-nums;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 @keyframes loader-data {
@@ -357,37 +360,19 @@ body.hud-minimized .toolbar > :not(#btn-toggle-hud) {
 
 .repo-link {
   flex: none;
-  padding: 3px 0;
-  color: var(--text-2);
-  font-size: 11px;
-  line-height: 1;
+  display: inline-flex;
+  padding: 4px;
+  margin: -4px 0;
+  border-radius: var(--r-ctl);
+  color: var(--text-3);
   text-decoration: none;
-  white-space: nowrap;
 }
 
 .repo-link:hover,
 .repo-link:focus-visible {
   color: var(--text);
-  text-decoration: underline;
-  text-underline-offset: 3px;
+  background: var(--hover);
 }
-
-.brand-subtitle {
-  font-size: 11.5px;
-  line-height: 1.4;
-  color: var(--text-3);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-#hud-fps {
-  font-weight: 650;
-  color: var(--text-2);
-}
-
-#hud-fps.fps-ok { color: var(--ok); }
-#hud-fps.fps-warn { color: var(--warn); }
-#hud-fps.fps-bad { color: var(--bad); }
 
 /* ------------------------------------------------------------------------------------------------------------------
    Top right: toolbar (time of day, teleport, map, clean view)
@@ -429,7 +414,7 @@ body.hud-minimized .toolbar > :not(#btn-toggle-hud) {
   background: var(--hover);
 }
 
-/* The active time of day spells out its name */
+/* Icons only: the name is in the tooltip and read out to screen readers */
 .time-btn .seg-label {
   max-width: 0;
   opacity: 0;
@@ -442,16 +427,10 @@ body.hud-minimized .toolbar > :not(#btn-toggle-hud) {
 
 .time-btn.active,
 .time-btn.active:hover {
-  gap: 7px;
-  padding: 0 12px 0 10px;
   background: var(--text);
   color: #121314;
 }
 
-.time-btn.active .seg-label {
-  max-width: 120px;
-  opacity: 1;
-}
 
 .tool-btn {
   height: 36px;
@@ -728,22 +707,6 @@ body.hud-minimized .icon-show {
   pointer-events: none;
 }
 
-.radar-key {
-  position: absolute;
-  top: 9px;
-  right: 9px;
-  z-index: 1;
-  color: rgba(255, 255, 255, 0.85);
-  background: rgba(10, 12, 15, 0.6);
-  transition: background-color 0.2s ease, color 0.2s ease;
-}
-
-.radar:hover .radar-key {
-  color: var(--taxi-ink);
-  background: var(--taxi);
-  box-shadow: none;
-}
-
 /* ------------------------------------------------------------------------------------------------------------------
    Bottom centre: travel mode switcher & keyboard guide
    ------------------------------------------------------------------------------------------------------------------ */
@@ -758,7 +721,10 @@ body.hud-minimized .icon-show {
   color: rgba(255, 255, 255, 0.88);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75);
   pointer-events: none;
+  transition: opacity 0.8s var(--ease-out);
 }
+
+.controls-hint.is-faded { opacity: 0; }
 
 .hint {
   display: inline-flex;
@@ -805,7 +771,7 @@ body.hud-minimized .icon-show {
   position: relative;
   z-index: 1;
   height: 42px;
-  padding: 0 12px 0 11px;
+  padding: 0 13px;
   border-radius: 12px;
   display: inline-flex;
   align-items: center;
@@ -834,17 +800,6 @@ body.hud-minimized .icon-show {
   stroke-width: 1.7;
 }
 
-.mode-btn kbd {
-  margin-left: 2px;
-  transition: color 0.25s ease, background-color 0.25s ease;
-}
-
-.mode-btn.active kbd {
-  color: rgba(23, 20, 10, 0.62);
-  background: rgba(23, 20, 10, 0.1);
-  box-shadow: none;
-}
-
 /* ------------------------------------------------------------------------------------------------------------------
    Bottom right: speed cluster & camera switcher
    ------------------------------------------------------------------------------------------------------------------ */
@@ -865,16 +820,25 @@ body.hud-minimized .icon-show {
 }
 
 .gauge-label {
-  min-width: 0;
+  position: absolute;
+  width: 1px;
+  height: 1px;
   overflow: hidden;
-  text-overflow: ellipsis;
+  clip-path: inset(50%);
   white-space: nowrap;
-  font-size: 10.5px;
-  font-weight: 650;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+}
+
+.gauge-fps {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
   color: var(--text-3);
 }
+
+#hud-fps { font-weight: 650; }
+#hud-fps.fps-ok { color: var(--ok); }
+#hud-fps.fps-warn { color: var(--warn); }
+#hud-fps.fps-bad { color: var(--bad); }
 
 .gauge-alt {
   flex: none;
@@ -1247,13 +1211,27 @@ body[data-mode='helicopter'] .gauge-alt {
   .legend-counts { display: none; }
 }
 
+/* Icons first: every label stays in its button's tooltip and is read out to screen readers */
+.mode-label,
+.toolbar .tool-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.toolbar .tool-btn kbd,
+.camera-current kbd { display: none; }
+.toolbar .tool-btn:not(.icon-only) { gap: 4px; padding: 0 9px; }
+
 @media (max-width: 1360px) {
   .fullmap-legend { display: none; }
 }
 
 @media (max-width: 1240px) {
   .controls-hint { display: none; }
-  .mode-btn kbd { display: none; }
 }
 
 @media (max-width: 1080px) {
@@ -1268,8 +1246,7 @@ body[data-mode='helicopter'] .gauge-alt {
   :root { --edge: 12px; }
   .hud-top-left { top: calc(max(var(--edge), env(safe-area-inset-top)) + 62px); }
   .brand > .mta-bullet,
-  .brand-heading h1,
-  .brand-subtitle { display: none; }
+  .brand-heading h1 { display: none; }
   .brand { height: 44px; padding: 0 12px; }
   .repo-link { display: flex; align-items: center; gap: 4px; min-height: 44px; font-size: 12px; }
   .radar { width: 220px; height: 148px; }
