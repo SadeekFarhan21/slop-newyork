@@ -271,7 +271,7 @@ async function initApp() {
     subway: [[['W', 'S'], 'Walk'], [['Shift'], 'Run'], [['F'], 'Board / Get off'], [['Stairs'], 'Street'], [['5'], 'Exit']]
   };
   // Boosted top speeds in mph (controllers.js caps them at 8.2, 36, 19 & 52 m/s): full scale of the speed meter
-  const topSpeedMph = { person: 18, car: 81, cyclist: 43, helicopter: 116 };
+  const topSpeedMph = { person: 18, car: 81, cyclist: 43, helicopter: 116, subway: 75 };
 
   function renderControlHints(mode) {
     if (!elControlsHint) return;
@@ -846,7 +846,7 @@ async function initApp() {
 
       const activeEnt = controllerManager.getActiveEntity();
       const mode = controllerManager.activeMode;
-      const mph = Math.round(Math.abs(activeEnt.speed) * 2.237);
+      const mph = Math.round(Math.abs(subway.riding ? subway.speed : activeEnt.speed) * 2.237); // aboard: the train's
       const altFt = Math.max(0, Math.round(activeEnt.position.y * 3.281));
 
       if (elFps) {
@@ -854,7 +854,7 @@ async function initApp() {
         elFps.className = currentFps >= 50 ? 'fps-ok' : currentFps >= 30 ? 'fps-warn' : 'fps-bad';
       }
       if (elSpeed) elSpeed.textContent = String(mph);
-      if (elSpeedMeter) elSpeedMeter.style.transform = `scaleX(${Math.min(1, mph / (topSpeedMph[mode] || 80))})`;
+      if (elSpeedMeter) elSpeedMeter.style.transform = `scaleX(${Math.min(1, mph / (topSpeedMph[subway.riding ? 'subway' : mode] || 80))})`;
       document.body.classList.toggle('is-boosting', controllerManager.keys.boost && mph > 0);
       if (elAltitude) elAltitude.textContent = altFt.toLocaleString('en-US');
       // The street corner of the player on the follow cameras, of the camera itself on the scenic ones

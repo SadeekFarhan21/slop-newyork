@@ -42,7 +42,12 @@ function buildSubway() {
       if (onIsland(p)) entrances.push(p);
     } else if (e.type === 'node') stopNodes.set(e.id, toWorld(e.lon, e.lat));
   }
-  const routes = osm.filter((e) => e.type === 'relation' && e.tags?.network === 'NYC Subway' && SERVICES.includes(serviceOf(e.tags.ref)));
+  const all = osm.filter((e) => e.type === 'relation' && e.tags?.network === 'NYC Subway' && SERVICES.includes(serviceOf(e.tags.ref)));
+  // The daytime service: part-time variants (late nights, rush hours, weekends: the 2 running local overnight...) only
+  // stand in for a service that has no full-time route
+  const partTime = (r) => /late night|rush|weekend/i.test(r.tags.name || '');
+  const fullTime = new Set(all.filter((r) => !partTime(r)).map((r) => serviceOf(r.tags.ref)));
+  const routes = all.filter((r) => !partTime(r) || !fullTime.has(serviceOf(r.tags.ref)));
 
   // A relation's track in member order, as pieces on the island: each way turned to continue the previous one, a new
   // piece wherever the route leaves the island or a member is missing (outside the downloaded area)

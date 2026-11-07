@@ -30,10 +30,11 @@ const STAIR_RISE = 3.9; // up to the ceiling (the street is above the mezzanine)
 const STAIR_EXIT_RISE = 2.0; // climbing this high up a flight takes the player out to the street
 const CAR_LEN = 18.3; // a 60 ft car
 const CARS = 8;
-const TRAIN_PERIOD = 64; // seconds between trains on each track
-const APPROACH = 13; // seconds braking in from the tunnel
-const DWELL = 20; // seconds standing at the platform
-const RIDE_HANDOFF = APPROACH + DWELL + 16; // a ridden train is deep in the dark tunnel: on to the next station
+const TRAIN_PERIOD = 48; // seconds between trains on each track
+const APPROACH = 10; // seconds braking in from the tunnel
+const DWELL = 12; // seconds standing at the platform
+const DEPART = 10; // seconds pulling out: the ridden train, its tail clear of the platform, hands on to the next station
+const RIDE_HANDOFF = APPROACH + DWELL + DEPART;
 const BOARD_REACH = 1.6; // from the platform edge (F boards from this close)
 
 const BULLET_TEXT = { 1: '#fff', 2: '#fff', 3: '#fff', 4: '#fff', 5: '#fff', 6: '#fff', 7: '#fff', N: '#000', Q: '#000', R: '#000', W: '#000' };
@@ -324,17 +325,24 @@ function buildTrain(line, ref) {
 
 // Where a train's head is at time t of its cycle along a track running +z: in from the tunnel, slowing to a stop with
 // its head near the platform's far end, waiting with its doors to the platform, then out into the tunnel ahead
+const HEAD_STOP = PLATFORM_LEN / 2 - 6;
+const HEAD_REACH = HEAD_STOP + PLATFORM_LEN / 2 + 12; // braking from a head 12 m inside the tunnel: all of it out of sight
+// Pulling out as fast as it pulls in: at the hand-off the ridden train runs at the speed it arrives at the next station
+const DEPART_ACCEL = HEAD_REACH / (APPROACH * DEPART);
 function trainHead(t) {
-  const stop = PLATFORM_LEN / 2 - 6;
-  const approach = APPROACH;
-  const reach = stop + PLATFORM_LEN / 2 + 12; // braking from a head 12 m inside the tunnel: all of it out of sight
-  if (t < approach) {
-    const u = 1 - t / approach;
-    return stop - reach * u * u;
+  if (t < APPROACH) {
+    const u = 1 - t / APPROACH;
+    return HEAD_STOP - HEAD_REACH * u * u;
   }
-  if (t < approach + DWELL) return stop;
-  const s = t - approach - DWELL;
-  return stop + 0.9 * s * s; // the tail clears the platform ~13 s out, well inside the cycle
+  if (t < APPROACH + DWELL) return HEAD_STOP;
+  const s = t - APPROACH - DWELL;
+  return HEAD_STOP + DEPART_ACCEL * s * s; // the tail clears the platform just before the hand-off
+}
+// The train's speed (m/s) at time t of its cycle, for the speedometer of a rider
+function trainSpeed(t) {
+  if (t < APPROACH) return ((2 * HEAD_REACH) / APPROACH) * (1 - t / APPROACH);
+  if (t < APPROACH + DWELL) return 0;
+  return 2 * DEPART_ACCEL * (t - APPROACH - DWELL);
 }
 
 // The station, with the train on track `rideSide` (-1 west, 1 east) running `rideRef` when the player arrives on it
@@ -527,6 +535,8 @@ function createSubwaySystem(scene) {
       return `${ride.ref} train to ${ride.next ? ride.next.name : current.station.name}`;
     },
     get riding() { return !!ride; },
+    // The ridden train's speed in m/s (0 off a train)
+    get speed() { return ride ? trainSpeed(ride.train.t) : 0; },
     // Aboard the train standing at the platform beside (x, z): stepped in through its nearest door. Returns where the
     // player now stands (world x, y, z & heading), or null if no train stands there with its doors open.
     board(x, z) {
@@ -736,4 +746,4 @@ function createSubwaySystem(scene) {
   return system;
 }
 
-export { createSubwaySystem, routeFrame, routeDistance, nextStop, trainHead, STATIONS, PLATFORM_LEN, TRAIN_PERIOD };
+export { createSubwaySystem, routeFrame, routeDistance, nextStop, trainHead, trainSpeed, STATIONS, PLATFORM_LEN, TRAIN_PERIOD };
