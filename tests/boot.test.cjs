@@ -22,6 +22,12 @@ test('city module preloads start after the import map and before stylesheets', (
   assert.match(html, /<link rel="preconnect" href="https:\/\/cdn\.jsdelivr\.net" crossorigin\s*\/>/);
   const { imports } = JSON.parse(importMap[1]);
   assert.equal(imports.three, imports['three/webgpu'], 'Three.js aliases share one module instance');
+  // The builds import each other by relative URL: those must resolve to the very files the bare specifiers name
+  const build = new URL('./', imports['three/webgpu']).href;
+  const resolve = (url) => imports[url] ?? url;
+  assert.equal(resolve(`${build}three.tsl.js`), imports['three/tsl'], 'three.webgpu imports the three/tsl instance');
+  const minified = imports['three/webgpu'].endsWith('.min.js');
+  assert.equal(resolve(`${build}three.core.js`), `${build}three.core${minified ? '.min' : ''}.js`, 'one three.core instance');
 });
 
 test('native module entry and imports share canonical preloaded URLs on GitHub Pages', () => {
